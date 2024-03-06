@@ -22,6 +22,7 @@
 #include <config.h>
 #endif
 
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -52,6 +53,7 @@ GST_DEBUG_CATEGORY_EXTERN (v4l2_debug);
 #define DEFAULT_PROP_FLAGS              0
 #define DEFAULT_PROP_TV_NORM            0
 #define DEFAULT_PROP_IO_MODE            GST_V4L2_IO_AUTO
+#define DEFAULT_PROP_STRIDE_ALIGNMENT   16
 
 #define ENCODED_BUFFER_SIZE             (2 * 1024 * 1024)
 #define GST_V4L2_DEFAULT_WIDTH          320
@@ -129,6 +131,7 @@ static const GstV4L2FormatDesc gst_v4l2_formats[] = {
   /* Luminance+Chrominance formats */
   {V4L2_PIX_FMT_YVU410, TRUE, GST_V4L2_RAW},
   {V4L2_PIX_FMT_YVU420, TRUE, GST_V4L2_RAW},
+  {V4L2_PIX_FMT_YUV444P, TRUE, GST_V4L2_RAW},
   {V4L2_PIX_FMT_YVU420M, TRUE, GST_V4L2_RAW},
   {V4L2_PIX_FMT_YUYV, TRUE, GST_V4L2_RAW},
   {V4L2_PIX_FMT_YYUV, TRUE, GST_V4L2_RAW},
@@ -165,6 +168,11 @@ static const GstV4L2FormatDesc gst_v4l2_formats[] = {
   {V4L2_PIX_FMT_NV24, TRUE, GST_V4L2_RAW},
   {V4L2_PIX_FMT_NV42, TRUE, GST_V4L2_RAW},
   {V4L2_PIX_FMT_MM21, TRUE, GST_V4L2_RAW},
+  {V4L2_PIX_FMT_XV15, TRUE, GST_V4L2_RAW},
+  {V4L2_PIX_FMT_XV20, TRUE, GST_V4L2_RAW},
+
+  /* three planes -- one Y, one Cr, one  Cb  */
+  {V4L2_PIX_FMT_X403, TRUE, GST_V4L2_RAW},
 
   /* Bayer formats - see http://www.siliconimaging.com/RGB%20Bayer.htm */
   {V4L2_PIX_FMT_SBGGR8, TRUE, GST_V4L2_RAW},
@@ -430,6 +438,30 @@ gst_v4l2_object_install_properties_helper (GObjectClass * gobject_class,
           "When enabled, the pixel aspect ratio will be enforced", TRUE,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  /**
+   * GstV4l2Src:force-ntsc-tv:
+   *
+   * When enabled, capture NTSC DV (720x480i) content from
+   * NTSC TV D1 (720x486i) source.
+   */
+  g_object_class_install_property (gobject_class, PROP_FORCE_NTSC_TV,
+      g_param_spec_boolean ("force-ntsc-tv", "Capture NTSC DV from NTSC TV D1",
+          "When enabled, capture NTSC DV (720x480i) content from NTSC TV D1 (720x486i) source.",
+          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstV4l2Src:stride-align:
+   *
+   * Stride alignment
+   */
+  g_object_class_install_property (gobject_class, PROP_STRIDE_ALIGNMENT,
+      g_param_spec_uint ("stride-align", "Stride alignment",
+          "Stride will be aligned to specified value",
+          0, 256,
+          DEFAULT_PROP_STRIDE_ALIGNMENT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+          GST_PARAM_MUTABLE_READY));
+
   gst_type_mark_as_plugin_api (GST_TYPE_V4L2_DEVICE_FLAGS, 0);
   gst_type_mark_as_plugin_api (GST_TYPE_V4L2_TV_NORM, 0);
   gst_type_mark_as_plugin_api (GST_TYPE_V4L2_IO_MODE, 0);
@@ -520,10 +552,15 @@ gst_v4l2_object_new (GstElement * element,
   v4l2object->colors = NULL;
 
   v4l2object->keep_aspect = TRUE;
+  v4l2object->force_ntsc_tv = FALSE;
 
   v4l2object->n_v4l2_planes = 0;
 
   v4l2object->no_initial_format = FALSE;
+
+  v4l2object->sync_chan.enabled = FALSE;
+  v4l2object->xlnx_ll = FALSE;
+  v4l2object->xlnx_ll_dma_started = FALSE;
 
   v4l2object->poll = gst_poll_new (TRUE);
   v4l2object->can_poll_device = TRUE;
@@ -549,6 +586,8 @@ gst_v4l2_object_new (GstElement * element,
     v4l2object->mmap = mmap;
     v4l2object->munmap = munmap;
   }
+
+  v4l2object->stride_align = DEFAULT_PROP_STRIDE_ALIGNMENT;
 
   return v4l2object;
 }
@@ -624,8 +663,7 @@ gst_v4l2_object_set_property_helper (GstV4l2Object * v4l2object,
 {
   switch (prop_id) {
     case PROP_DEVICE:
-      g_free (v4l2object->videodev);
-      v4l2object->videodev = g_value_dup_string (value);
+      gst_v4l2_object_set_device (v4l2object, g_value_get_string (value));
       break;
     case PROP_BRIGHTNESS:
     case PROP_CONTRAST:
@@ -703,6 +741,9 @@ gst_v4l2_object_set_property_helper (GstV4l2Object * v4l2object,
         gst_v4l2_set_controls (v4l2object, v4l2object->extra_controls);
       break;
     }
+    case PROP_FORCE_NTSC_TV:
+      v4l2object->force_ntsc_tv = g_value_get_boolean (value);
+      break;
     case PROP_PIXEL_ASPECT_RATIO:
       if (v4l2object->par) {
         g_value_unset (v4l2object->par);
@@ -721,6 +762,9 @@ gst_v4l2_object_set_property_helper (GstV4l2Object * v4l2object,
       break;
     case PROP_FORCE_ASPECT_RATIO:
       v4l2object->keep_aspect = g_value_get_boolean (value);
+      break;
+    case PROP_STRIDE_ALIGNMENT:
+      v4l2object->stride_align = g_value_get_uint (value);
       break;
     default:
       return FALSE;
@@ -818,6 +862,12 @@ gst_v4l2_object_get_property_helper (GstV4l2Object * v4l2object,
       break;
     case PROP_FORCE_ASPECT_RATIO:
       g_value_set_boolean (value, v4l2object->keep_aspect);
+      break;
+    case PROP_FORCE_NTSC_TV:
+      g_value_set_boolean (value, v4l2object->force_ntsc_tv);
+      break;
+    case PROP_STRIDE_ALIGNMENT:
+      g_value_set_uint (value, v4l2object->stride_align);
       break;
     default:
       return FALSE;
@@ -1101,6 +1151,9 @@ gst_v4l2_object_format_get_rank (const struct v4l2_fmtdesc *fmt)
     case V4L2_PIX_FMT_MM21:    /* NV12 Y 16x32, UV 16x16 tile */
     case V4L2_PIX_FMT_NV12M_8L128:
     case V4L2_PIX_FMT_NV12M_10BE_8L128:
+    case V4L2_PIX_FMT_XV15:
+    case V4L2_PIX_FMT_XV20:
+    case V4L2_PIX_FMT_X403:
       rank = YUV_ODD_BASE_RANK;
       break;
 
@@ -1138,6 +1191,7 @@ gst_v4l2_object_format_get_rank (const struct v4l2_fmtdesc *fmt)
       rank = YUV_BASE_RANK + 4;
       break;
     case V4L2_PIX_FMT_YUV422P: /* Y42B, 16 bits per pixel */
+    case V4L2_PIX_FMT_YUV444P: /* Y444P, 24 bits per pixel */
       rank = YUV_BASE_RANK + 8;
       break;
 
@@ -1375,6 +1429,9 @@ gst_v4l2_object_v4l2fourcc_to_video_format (guint32 fourcc)
     case V4L2_PIX_FMT_NV12M:
       format = GST_VIDEO_FORMAT_NV12;
       break;
+    case V4L2_PIX_FMT_YUV444P:
+      format = GST_VIDEO_FORMAT_Y444;
+      break;
     case V4L2_PIX_FMT_NV12MT:
       format = GST_VIDEO_FORMAT_NV12_64Z32;
       break;
@@ -1430,6 +1487,15 @@ gst_v4l2_object_v4l2fourcc_to_video_format (guint32 fourcc)
       break;
     case V4L2_PIX_FMT_NV24:
       format = GST_VIDEO_FORMAT_NV24;
+      break;
+    case V4L2_PIX_FMT_XV15:
+      format = GST_VIDEO_FORMAT_NV12_10LE32;
+      break;
+    case V4L2_PIX_FMT_XV20:
+      format = GST_VIDEO_FORMAT_NV16_10LE32;
+      break;
+    case V4L2_PIX_FMT_X403:
+      format = GST_VIDEO_FORMAT_Y444_10LE32;
       break;
     default:
       format = GST_VIDEO_FORMAT_UNKNOWN;
@@ -1555,6 +1621,7 @@ gst_v4l2_object_v4l2fourcc_to_bare_struct (guint32 fourcc)
     case V4L2_PIX_FMT_XBGR32:
     case V4L2_PIX_FMT_ABGR32:
     case V4L2_PIX_FMT_NV12:    /* 12  Y/CbCr 4:2:0  */
+    case V4L2_PIX_FMT_YUV444P:    /* 24 YCbCr 4:4:4  */
     case V4L2_PIX_FMT_NV12M:
     case V4L2_PIX_FMT_NV12MT:
     case V4L2_PIX_FMT_MM21:
@@ -1577,7 +1644,10 @@ gst_v4l2_object_v4l2fourcc_to_bare_struct (guint32 fourcc)
     case V4L2_PIX_FMT_UYVY:
     case V4L2_PIX_FMT_YUV422P:
     case V4L2_PIX_FMT_YVYU:
-    case V4L2_PIX_FMT_YUV411P:{
+    case V4L2_PIX_FMT_YUV411P:
+    case V4L2_PIX_FMT_XV15:
+    case V4L2_PIX_FMT_XV20:
+    case V4L2_PIX_FMT_X403:{
       GstVideoFormat format;
       format = gst_v4l2_object_v4l2fourcc_to_video_format (fourcc);
       if (format != GST_VIDEO_FORMAT_UNKNOWN)
@@ -1686,6 +1756,14 @@ gst_v4l2_object_is_raw (GstV4l2Object * v4l2object)
     }
   }
   return FALSE;
+}
+
+#define SYNC_IP_DEV_ENCODER "/dev/xlnxsync0"
+
+static gboolean
+xlnx_ll_supported (void)
+{
+  return g_file_test (SYNC_IP_DEV_ENCODER, G_FILE_TEST_EXISTS);
 }
 
 /* Add an 'alternate' variant of the caps with the feature */
@@ -1855,8 +1933,20 @@ gst_v4l2_object_get_caps_info (GstV4l2Object * v4l2object, GstCaps * caps,
         fourcc = V4L2_PIX_FMT_NV12;
         fourcc_nc = V4L2_PIX_FMT_NV12M;
         break;
+      case GST_VIDEO_FORMAT_Y444:
+        fourcc = V4L2_PIX_FMT_YUV444P;
+        break;
+      case GST_VIDEO_FORMAT_Y444_10LE32:
+        fourcc = V4L2_PIX_FMT_X403;
+        break;
       case GST_VIDEO_FORMAT_NV12_64Z32:
         fourcc_nc = V4L2_PIX_FMT_NV12MT;
+        break;
+      case GST_VIDEO_FORMAT_NV12_10LE32:
+        fourcc = V4L2_PIX_FMT_XV15;
+        break;
+      case GST_VIDEO_FORMAT_NV16_10LE32:
+        fourcc = V4L2_PIX_FMT_XV20;
         break;
       case GST_VIDEO_FORMAT_NV12_16L32S:
         fourcc_nc = V4L2_PIX_FMT_MM21;
@@ -2005,18 +2095,17 @@ gst_v4l2_object_get_caps_info (GstV4l2Object * v4l2object, GstCaps * caps,
     }
   }
 
+  /* Prefer the contiguous if supported */
+  v4l2object->prefered_non_contiguous = FALSE;
 
-  /* Prefer the non-contiguous if supported */
-  v4l2object->prefered_non_contiguous = TRUE;
-
-  if (fourcc_nc)
-    fmt = gst_v4l2_object_get_format_from_fourcc (v4l2object, fourcc_nc);
+  if (fourcc)
+    fmt = gst_v4l2_object_get_format_from_fourcc (v4l2object, fourcc);
   else if (fourcc == 0)
     goto unhandled_format;
 
   if (fmt == NULL) {
-    fmt = gst_v4l2_object_get_format_from_fourcc (v4l2object, fourcc);
-    v4l2object->prefered_non_contiguous = FALSE;
+    fmt = gst_v4l2_object_get_format_from_fourcc (v4l2object, fourcc_nc);
+    v4l2object->prefered_non_contiguous = TRUE;
   }
 
   if (fmt == NULL)
@@ -2074,6 +2163,25 @@ gst_v4l2src_value_simplify (GValue * val)
 
   return FALSE;
 }
+
+static gboolean
+gst_v4l2_object_set_low_latency_capture_mode (GstV4l2Object * v4l2object,
+    gboolean enable)
+{
+  struct v4l2_control control = { 0, };
+
+  control.id = V4L2_CID_XILINX_LOW_LATENCY;
+  control.value = enable ? XVIP_LOW_LATENCY_ENABLE : XVIP_LOW_LATENCY_DISABLE;
+
+  if (v4l2object->ioctl (v4l2object->video_fd, VIDIOC_S_CTRL, &control) != 0) {
+    GST_WARNING_OBJECT (v4l2object->dbg_obj,
+        "Failed to enable low latency on capture device");
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
 
 static gboolean
 gst_v4l2_object_get_interlace_mode (enum v4l2_field field,
@@ -2277,10 +2385,15 @@ gst_v4l2_object_get_colorspace (GstV4l2Object * v4l2object,
       cinfo->transfer = GST_VIDEO_TRANSFER_SMPTE240M;
       break;
     case V4L2_XFER_FUNC_NONE:
-      cinfo->transfer = GST_VIDEO_TRANSFER_GAMMA10;
+      GST_WARNING
+          ("GAMMA 10, 18, 20, 22, 28 transfer functions all share the same V4L2 enumeration. Force caps to be renegotiated with upstream elements' caps");
+      ret = FALSE;
       break;
     case V4L2_XFER_FUNC_SMPTE2084:
       cinfo->transfer = GST_VIDEO_TRANSFER_SMPTE2084;
+      break;
+    case V4L2_XFER_FUNC_HLG:
+      cinfo->transfer = GST_VIDEO_TRANSFER_ARIB_STD_B67;
       break;
     case V4L2_XFER_FUNC_DEFAULT:
       /* nothing, just use defaults for colorspace */
@@ -2691,10 +2804,10 @@ return_data:
       "height", G_TYPE_INT, (gint) height, NULL);
 
   gst_v4l2_object_add_aspect_ratio (v4l2object, s);
+  gst_v4l2_object_add_interlace_mode (v4l2object, s, width, height,
+      pixelformat);
 
   if (!v4l2object->skip_try_fmt_probes) {
-    gst_v4l2_object_add_interlace_mode (v4l2object, s, width, height,
-        pixelformat);
     gst_v4l2_object_add_colorspace (v4l2object, s, width, height, pixelformat);
   }
 
@@ -2746,6 +2859,7 @@ static void
 check_alternate_and_append_struct (GstCaps * caps, GstStructure * s)
 {
   const GValue *mode;
+  GstCapsFeatures *features = NULL;
 
   mode = gst_structure_get_value (s, "interlace-mode");
   if (!mode)
@@ -2754,12 +2868,9 @@ check_alternate_and_append_struct (GstCaps * caps, GstStructure * s)
   if (G_VALUE_HOLDS_STRING (mode)) {
     /* Add the INTERLACED feature if the mode is alternate */
     if (!g_strcmp0 (gst_structure_get_string (s, "interlace-mode"),
-            "alternate")) {
-      GstCapsFeatures *feat;
-
-      feat = gst_caps_features_new (GST_CAPS_FEATURE_FORMAT_INTERLACED, NULL);
-      gst_caps_set_features (caps, gst_caps_get_size (caps) - 1, feat);
-    }
+            "alternate"))
+      features =
+          gst_caps_features_new (GST_CAPS_FEATURE_FORMAT_INTERLACED, NULL);
   } else if (GST_VALUE_HOLDS_LIST (mode)) {
     /* If the mode is a list containing alternate, remove it from the list and add a
      * variant with interlace-mode=alternate and the INTERLACED feature. */
@@ -2787,7 +2898,17 @@ check_alternate_and_append_struct (GstCaps * caps, GstStructure * s)
   }
 
 done:
-  gst_caps_append_structure (caps, s);
+  gst_caps_append_structure_full (caps, s, features);
+}
+
+static void
+dup_struct_with_xlnx_ll (GstCaps * caps, GstStructure * s)
+{
+  GstStructure *copy;
+
+  copy = gst_structure_copy (s);
+  gst_caps_append_structure_full (caps, copy,
+      gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_XLNX_LL, NULL));
 }
 
 static void
@@ -2832,6 +2953,15 @@ gst_v4l2_object_update_and_append (GstV4l2Object * v4l2object,
 
   if (alt_s) {
     check_alternate_and_append_struct (caps, alt_s);
+  }
+
+  if ((v4l2object->type == V4L2_BUF_TYPE_VIDEO_CAPTURE
+          || v4l2object->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+      && xlnx_ll_supported ()) {
+    dup_struct_with_xlnx_ll (caps, s);
+    if (alt_s) {
+      dup_struct_with_xlnx_ll (caps, alt_s);
+    }
   }
 }
 
@@ -3609,6 +3739,8 @@ gst_v4l2_object_set_format_full (GstV4l2Object * v4l2object, GstCaps * caps,
   GstStructure *s;
   gboolean disable_interlacing = FALSE;
   gboolean disable_colorimetry = FALSE;
+  GstCapsFeatures *features;
+
 
   g_return_val_if_fail (!v4l2object->skip_try_fmt_probes ||
       gst_caps_is_writable (caps), FALSE);
@@ -3636,6 +3768,13 @@ gst_v4l2_object_set_format_full (GstV4l2Object * v4l2object, GstCaps * caps,
   }
   fps_n = GST_VIDEO_INFO_FPS_N (&info);
   fps_d = GST_VIDEO_INFO_FPS_D (&info);
+
+  if (v4l2object->force_ntsc_tv && height == 240) {
+    height = 243;
+    width = 720;
+    GST_LOG_OBJECT (v4l2object->dbg_obj,
+        "Forcing format to TV D1 NTSC (720x486i)");
+  }
 
   /* if encoded format (GST_VIDEO_INFO_N_PLANES return 0)
    * or if contiguous is preferred */
@@ -3723,6 +3862,9 @@ gst_v4l2_object_set_format_full (GstV4l2Object * v4l2object, GstCaps * caps,
     case GST_VIDEO_COLOR_MATRIX_UNKNOWN:
       /* We let the driver pick a default one */
       break;
+    case GST_VIDEO_TRANSFER_ARIB_STD_B67:
+      transfer = V4L2_XFER_FUNC_HLG;
+      break;
     default:
       GST_WARNING_OBJECT (v4l2object->dbg_obj,
           "Unknown colorimetry matrix %d", info.colorimetry.matrix);
@@ -3761,6 +3903,9 @@ gst_v4l2_object_set_format_full (GstV4l2Object * v4l2object, GstCaps * caps,
       GST_WARNING_OBJECT (v4l2object->dbg_obj,
           "LOG 100, 316 transfer functions not supported");
       /* FIXME No known sensible default, maybe AdobeRGB ? */
+      break;
+    case GST_VIDEO_TRANSFER_ARIB_STD_B67:
+      transfer = V4L2_XFER_FUNC_HLG;
       break;
     case GST_VIDEO_TRANSFER_UNKNOWN:
       /* We let the driver pick a default one */
@@ -3816,6 +3961,12 @@ gst_v4l2_object_set_format_full (GstV4l2Object * v4l2object, GstCaps * caps,
       if (GST_VIDEO_FORMAT_INFO_IS_TILED (info.finfo))
         stride = GST_VIDEO_TILE_X_TILES (stride) *
             GST_VIDEO_FORMAT_INFO_TILE_STRIDE (info.finfo, i);
+
+      gint align, remainder;
+      align = v4l2object->stride_align;
+      remainder = (stride & (align - 1));
+      if (remainder)
+        stride = stride - remainder + align;
 
       format.fmt.pix_mp.plane_fmt[i].bytesperline = stride;
     }
@@ -3960,20 +4111,13 @@ gst_v4l2_object_set_format_full (GstV4l2Object * v4l2object, GstCaps * caps,
         goto invalid_colorimetry;
     }
   } else {
-    /* The driver (or libv4l2) is miss-behaving, just ignore colorimetry from
-     * the TRY_FMT */
+    /* The driver (or libv4l2) is miss-behaving, allow caps to be renegotiated with upstream elements' caps */
     disable_colorimetry = TRUE;
-    if (gst_structure_has_field (s, "colorimetry"))
-      gst_structure_remove_field (s, "colorimetry");
   }
 
   /* In case we have skipped the try_fmt probes, we'll need to set the
-   * interlace-mode and colorimetry back into the caps. */
+   * colorimetry back into the caps. */
   if (v4l2object->skip_try_fmt_probes) {
-    if (!disable_interlacing && !gst_structure_has_field (s, "interlace-mode")) {
-      gst_structure_set (s, "interlace-mode", G_TYPE_STRING,
-          gst_video_interlace_mode_to_string (info.interlace_mode), NULL);
-    }
     if (!disable_colorimetry && !gst_structure_has_field (s, "colorimetry")) {
       gchar *str = gst_video_colorimetry_to_string (&info.colorimetry);
       gst_structure_set (s, "colorimetry", G_TYPE_STRING, str, NULL);
@@ -4099,6 +4243,20 @@ gst_v4l2_object_set_format_full (GstV4l2Object * v4l2object, GstCaps * caps,
   }
 
 done:
+  features = gst_caps_get_features (caps, 0);
+  if (features &&
+      gst_caps_features_contains (features, GST_CAPS_FEATURE_MEMORY_XLNX_LL)) {
+    GST_DEBUG_OBJECT (v4l2object, "Found XLNX-LL memory feature");
+    v4l2object->xlnx_ll = TRUE;
+    /* HACK: Always reset low latency mode to ensure v4l2 cache is updated */
+    if (!gst_v4l2_object_set_low_latency_capture_mode (v4l2object, FALSE))
+      GST_ERROR_OBJECT (v4l2object, "Driver failed to deactivate XLNX-LL");
+    if (!gst_v4l2_object_set_low_latency_capture_mode (v4l2object, TRUE)) {
+      GST_ERROR_OBJECT (v4l2object, "Driver failed to activate XLNX-LL");
+      v4l2object->xlnx_ll = FALSE;
+    }
+  }
+
   /* add boolean return, so we can fail on drivers bugs */
   gst_v4l2_object_save_format (v4l2object, fmtdesc, &format, &info, &align);
 
@@ -4317,7 +4475,7 @@ gst_v4l2_object_acquire_format (GstV4l2Object * v4l2object, GstVideoInfo * info)
   /* Use the default compose rectangle */
   memset (&sel, 0, sizeof (struct v4l2_selection));
   sel.type = v4l2object->type;
-  sel.target = V4L2_SEL_TGT_COMPOSE_DEFAULT;
+  sel.target = V4L2_SEL_TGT_COMPOSE;
   if (v4l2object->ioctl (v4l2object->video_fd, VIDIOC_G_SELECTION, &sel) >= 0) {
     r = &sel.r;
   } else {
@@ -4431,9 +4589,15 @@ gst_v4l2_object_set_crop (GstV4l2Object * obj, struct v4l2_rect * crop_rect)
   GST_V4L2_CHECK_OPEN (obj);
 
   sel.type = obj->type;
-  sel.target = V4L2_SEL_TGT_CROP;
+  sel.target = V4L2_SEL_TGT_COMPOSE;
   sel.flags = 0;
   sel.r = *crop_rect;
+
+  if (obj->force_ntsc_tv && sel.r.height == 240) {
+    sel.r.height = 243;
+    sel.r.width = 720;
+    GST_LOG_OBJECT (obj->dbg_obj, "Forcing crop to TV D1 NTSC (720x486i)");
+  }
 
   crop.type = obj->type;
   crop.c = sel.r;
@@ -4694,6 +4858,13 @@ gst_v4l2_object_stop (GstV4l2Object * v4l2object)
       }
     }
     gst_object_unref (pool);
+  }
+
+  if (v4l2object->sync_chan.enabled) {
+    xvfbsync_enc_sync_chan_depopulate (&v4l2object->enc_sync_chan);
+    close (v4l2object->syncip.fd);
+    if (!gst_v4l2_object_set_low_latency_capture_mode (v4l2object, FALSE))
+      GST_ERROR_OBJECT (v4l2object, "Driver failed to deactivate XLNX-LL");
   }
 
   GST_V4L2_SET_INACTIVE (v4l2object);
@@ -5190,6 +5361,11 @@ gst_v4l2_object_decide_allocation (GstV4l2Object * obj, GstQuery * query)
      * frame. */
     own_min = min + obj->min_buffers + 2;
 
+    /* Allocate only 3 bufs as syncip has only 3 buffer slots available to be
+     * programmed at a time. */
+    if (obj->xlnx_ll)
+      own_min = 3;
+
     /* If no allocation parameters where provided, allow for a little more
      * buffers and enable copy threshold */
     if (!update) {
@@ -5215,6 +5391,12 @@ gst_v4l2_object_decide_allocation (GstV4l2Object * obj, GstQuery * query)
     /* To import we need the other pool to hold at least own_min */
     if (obj_pool == pool)
       min += own_min;
+
+    /* For Xilinx Low Latency mode need to have same buffers in own pool as
+       downstream buffers so that no buffer get queued and no buffer slot get
+       programmed until downstream has completed previous buffer */
+    if (obj->xlnx_ll)
+      own_min = min;
   }
 
   /* Request a bigger max, if one was suggested but it's too small */
@@ -5641,4 +5823,27 @@ gst_v4l2_object_subscribe_event (GstV4l2Object * v4l2object, guint32 event)
   }
 
   return FALSE;
+}
+
+void
+gst_v4l2_object_set_device (GstV4l2Object * v4l2object, const gchar * device)
+{
+  g_free (v4l2object->videodev);
+  v4l2object->videodev = g_strdup (device);
+}
+
+gboolean
+gst_v4l2_object_get_exclusive_lock (GstV4l2Object * v4l2object)
+{
+  g_return_val_if_fail (GST_V4L2_IS_OPEN (v4l2object), FALSE);
+
+  return flock (v4l2object->video_fd, LOCK_EX | LOCK_NB) == 0;
+}
+
+gboolean
+gst_v4l2_object_release_exclusive_lock (GstV4l2Object * v4l2object)
+{
+  g_return_val_if_fail (GST_V4L2_IS_OPEN (v4l2object), FALSE);
+
+  return flock (v4l2object->video_fd, LOCK_UN | LOCK_NB) == 0;
 }

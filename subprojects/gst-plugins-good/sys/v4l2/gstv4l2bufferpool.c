@@ -52,6 +52,11 @@ GST_DEBUG_CATEGORY_STATIC (CAT_PERFORMANCE);
 
 #define GST_V4L2_IMPORT_QUARK gst_v4l2_buffer_pool_import_quark ()
 
+/* FIXME: HW ALIGNMENT to be passed from omx */
+#define HORIZONTAL_ALIGNMENT 64
+#define VERTICAL_ALIGNMENT 32
+
+#define SYNC_IP_DEV_ENCODER "/dev/xlnxsync0"
 
 /*
  * GstV4l2BufferPool:
@@ -699,6 +704,27 @@ gst_v4l2_buffer_pool_streamon (GstV4l2BufferPool * pool)
       if (obj->ioctl (pool->video_fd, VIDIOC_STREAMON, &obj->type) < 0)
         goto streamon_failed;
 
+      if (obj->xlnx_ll) {
+        ChannelIntr intr_mask = { 0 };
+        intr_mask.prod_lfbdone = 1;
+        intr_mask.prod_cfbdone = 1;
+        intr_mask.cons_lfbdone = 1;
+        intr_mask.cons_cfbdone = 1;
+
+
+        if (xvfbsync_enc_sync_chan_enable (&obj->enc_sync_chan)) {
+          GST_ERROR_OBJECT (pool, "Error with enabling sync ip");
+          goto streamon_failed;
+        }
+
+        if (xvfbsync_enc_sync_chan_set_intr_mask (&obj->enc_sync_chan,
+                &intr_mask)) {
+          GST_ERROR_OBJECT (pool, "Error with setting interrupt mask");
+          goto streamon_failed;
+        }
+
+      }
+
       pool->streaming = TRUE;
 
       GST_DEBUG_OBJECT (pool, "Started streaming");
@@ -742,6 +768,9 @@ gst_v4l2_buffer_pool_streamoff (GstV4l2BufferPool * pool)
 
       GST_DEBUG_OBJECT (pool, "Stopped streaming");
 
+      if (pool->obj->xlnx_ll_dma_started)
+        pool->obj->xlnx_ll_dma_started = FALSE;
+
       if (pool->vallocator)
         gst_v4l2_allocator_flush (pool->vallocator);
       break;
@@ -784,6 +813,22 @@ gst_v4l2_buffer_pool_start (GstBufferPool * bpool)
   gboolean can_allocate = FALSE, ret = TRUE;
 
   GST_DEBUG_OBJECT (pool, "activating pool");
+
+  if (obj->xlnx_ll) {
+    gint syncip_fd;
+
+    syncip_fd = open (SYNC_IP_DEV_ENCODER, O_RDWR);
+    if (syncip_fd == -1)
+      goto xvfbsync_open_failed;
+
+    if (xvfbsync_syncip_chan_populate (&obj->syncip, &obj->sync_chan,
+            syncip_fd))
+      goto xvfbsync_populate_failed;
+
+    if (xvfbsync_enc_sync_chan_populate (&obj->enc_sync_chan, &obj->sync_chan,
+            HORIZONTAL_ALIGNMENT, VERTICAL_ALIGNMENT))
+      goto xvfbsync_chan_populate_failed;
+  }
 
   if (pool->other_pool) {
     GstBuffer *buffer;
@@ -976,6 +1021,21 @@ cannot_import:
     GST_ERROR_OBJECT (pool, "cannot import buffers from downstream pool");
     return FALSE;
   }
+xvfbsync_open_failed:
+  {
+    GST_ERROR_OBJECT (pool, "Failed to open syncip fd");
+    return FALSE;
+  }
+xvfbsync_populate_failed:
+  {
+    GST_ERROR_OBJECT (pool, "Failed to initialize syncip");
+    return FALSE;
+  }
+xvfbsync_chan_populate_failed:
+  {
+    GST_ERROR_OBJECT (pool, "Failed to initialize syncip channel");
+    return FALSE;
+  }
 }
 
 static gboolean
@@ -1090,6 +1150,10 @@ gst_v4l2_buffer_pool_flush_start (GstBufferPool * bpool)
 
   if (pool->other_pool && gst_buffer_pool_is_active (pool->other_pool))
     gst_buffer_pool_set_flushing (pool->other_pool, TRUE);
+
+  if (pool->obj->xlnx_ll) {
+    pool->obj->xlnx_ll = FALSE;
+  }
 }
 
 static void
@@ -1170,6 +1234,15 @@ gst_v4l2_buffer_pool_qbuf (GstV4l2BufferPool * pool, GstBuffer * buf,
     else
       field = obj->format.fmt.pix.field;
 
+    /* If interlaced alternate, specify if buffer is top or bottom */
+    if (field == V4L2_FIELD_ALTERNATE) {
+      if ((GST_BUFFER_FLAGS (buf) & GST_VIDEO_BUFFER_FLAG_TOP_FIELD) ==
+          GST_VIDEO_BUFFER_FLAG_TOP_FIELD)
+        field = V4L2_FIELD_TOP;
+      else
+        field = V4L2_FIELD_BOTTOM;
+    }
+
     group->buffer.field = field;
   }
 
@@ -1194,6 +1267,45 @@ gst_v4l2_buffer_pool_qbuf (GstV4l2BufferPool * pool, GstBuffer * buf,
 
   g_atomic_int_inc (&pool->num_queued);
   pool->buffers[index] = buf;
+
+  if (obj->xlnx_ll) {
+    const GstVideoInfo *info;
+    GstV4l2Object *obj_unlocked = pool->obj;
+    XLNXLLBuf *xlnxll_buf = xvfbsync_xlnxll_buf_new ();
+    ChannelStatus *channel_status = obj_unlocked->sync_chan.channel_status;
+
+    if (gst_is_v4l2_memory (group->mem[0]))
+      /* dma-buf import mode  */
+      xlnxll_buf->dma_fd = ((GstV4l2Memory *) group->mem[0])->dmafd;
+    else
+      /* dma-buf export mode */
+      xlnxll_buf->dma_fd = gst_dmabuf_memory_get_fd (group->mem[0]);
+
+    info = &obj->info;
+    xlnxll_buf->t_dim.i_width = info->width;
+    xlnxll_buf->t_dim.i_height = info->height;
+    xlnxll_buf->t_fourcc = gst_video_format_to_fourcc (info->finfo->format);
+    xlnxll_buf->t_planes[PLANE_Y].i_offset = info->offset[PLANE_Y];
+    xlnxll_buf->t_planes[PLANE_Y].i_pitch = info->stride[PLANE_Y];
+    xlnxll_buf->t_planes[PLANE_UV].i_offset = info->offset[PLANE_UV];
+    xlnxll_buf->t_planes[PLANE_UV].i_pitch = info->stride[PLANE_UV];
+    xlnxll_buf->t_planes[PLANE_MAP_Y].i_offset = info->offset[PLANE_MAP_Y];
+    xlnxll_buf->t_planes[PLANE_MAP_Y].i_pitch = info->stride[PLANE_MAP_Y];
+    xlnxll_buf->t_planes[PLANE_MAP_UV].i_offset = info->offset[PLANE_MAP_UV];
+    xlnxll_buf->t_planes[PLANE_MAP_UV].i_pitch = info->stride[PLANE_MAP_UV];
+    xvfbsync_enc_sync_chan_add_buffer (&obj_unlocked->enc_sync_chan,
+        xlnxll_buf);
+
+    pthread_mutex_lock (&(channel_status->mutex));
+    if (channel_status->err_cond) {
+      channel_status->err_cond = 0;
+      pthread_mutex_unlock (&(channel_status->mutex));
+      xvfbsync_syncip_reset_err_status (&obj_unlocked->enc_sync_chan,
+          &channel_status->err);
+    } else {
+      pthread_mutex_unlock (&(channel_status->mutex));
+    }
+  }
 
   if (!gst_v4l2_allocator_qbuf (pool->vallocator, group))
     goto queue_failed;
@@ -1574,8 +1686,18 @@ gst_v4l2_buffer_pool_complete_release_buffer (GstBufferPool * bpool,
 
             gst_v4l2_allocator_reset_group (pool->vallocator, group);
             /* queue back in the device */
-            if (pool->other_pool)
+            if (pool->other_pool) {
+              if (pool->streaming && pool->obj->xlnx_ll
+                  && !pool->obj->xlnx_ll_dma_started) {
+                GST_INFO_OBJECT (pool,
+                    "Don't acquire from downstream as dma not started");
+                pclass->release_buffer (bpool, buffer);
+                break;
+              }
+
               ret = gst_v4l2_buffer_pool_prepare_buffer (pool, buffer, NULL);
+            }
+
             if (ret != GST_FLOW_OK ||
                 gst_v4l2_buffer_pool_qbuf (pool, buffer, group,
                     NULL) != GST_FLOW_OK)
@@ -1792,6 +1914,15 @@ gst_v4l2_buffer_pool_new (GstV4l2Object * obj, GstCaps * caps)
   /* This will simply set a default config, but will not configure the pool
    * because min and max are not valid */
   gst_buffer_pool_set_config (GST_BUFFER_POOL_CAST (pool), config);
+
+  if (obj->xlnx_ll) {
+    GST_DEBUG_OBJECT (pool, "Disable CREATE_BUFS for low latency mode");
+    /* Disable CREATE_BUFS in low latency mode */
+    GST_OBJECT_FLAG_UNSET (pool->vallocator,
+        GST_V4L2_ALLOCATOR_FLAG_MMAP_CREATE_BUFS
+        | GST_V4L2_ALLOCATOR_FLAG_USERPTR_CREATE_BUFS
+        | GST_V4L2_ALLOCATOR_FLAG_DMABUF_CREATE_BUFS);
+  }
 
   return GST_BUFFER_POOL (pool);
 

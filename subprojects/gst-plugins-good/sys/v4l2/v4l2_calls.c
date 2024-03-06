@@ -564,24 +564,27 @@ gst_v4l2_open (GstV4l2Object * v4l2object, GstV4l2Error * error)
   if (libv4l2_fd != -1)
     v4l2object->video_fd = libv4l2_fd;
 
-  /* get capabilities, error will be posted */
-  if (!gst_v4l2_get_capabilities (v4l2object))
-    goto error;
+  /* type=0 can be used with sudev which doesn't implement VIDIOC_QUERYCAP */
+  if (v4l2object->type) {
+    /* get capabilities, error will be posted */
+    if (!gst_v4l2_get_capabilities (v4l2object))
+      goto error;
 
-  /* do we need to be a capture device? */
-  if (GST_IS_V4L2SRC (v4l2object->element) &&
-      !(v4l2object->device_caps & (V4L2_CAP_VIDEO_CAPTURE |
-              V4L2_CAP_VIDEO_CAPTURE_MPLANE)))
-    goto not_capture;
+    /* do we need to be a capture device? */
+    if (GST_IS_V4L2SRC (v4l2object->element) &&
+        !(v4l2object->device_caps & (V4L2_CAP_VIDEO_CAPTURE |
+                V4L2_CAP_VIDEO_CAPTURE_MPLANE)))
+      goto not_capture;
 
-  if (GST_IS_V4L2SINK (v4l2object->element) &&
-      !(v4l2object->device_caps & (V4L2_CAP_VIDEO_OUTPUT |
-              V4L2_CAP_VIDEO_OUTPUT_MPLANE)))
-    goto not_output;
+    if (GST_IS_V4L2SINK (v4l2object->element) &&
+        !(v4l2object->device_caps & (V4L2_CAP_VIDEO_OUTPUT |
+                V4L2_CAP_VIDEO_OUTPUT_MPLANE)))
+      goto not_output;
 
-  if (GST_IS_V4L2_VIDEO_DEC (v4l2object->element) &&
-      !GST_V4L2_IS_M2M (v4l2object->device_caps))
-    goto not_m2m;
+    if (GST_IS_V4L2_VIDEO_DEC (v4l2object->element) &&
+        !GST_V4L2_IS_M2M (v4l2object->device_caps))
+      goto not_m2m;
+  }
 
   gst_v4l2_adjust_buf_type (v4l2object);
 
@@ -1243,38 +1246,59 @@ gst_v4l2_event_to_string (guint32 event)
   return "UNKNOWN";
 }
 
-gboolean
-gst_v4l2_subscribe_event (GstV4l2Object * v4l2object, guint32 event, guint32 id)
-{
-  struct v4l2_event_subscription sub = {.type = event,.id = id, };
-  gint ret;
 
-  GST_DEBUG_OBJECT (v4l2object->dbg_obj, "Subscribing to '%s' event",
-      gst_v4l2_event_to_string (event));
+gboolean
+gst_v4l2_subscribe_event (GstV4l2Object * v4l2object, guint32 type, guint32 id,
+    guint32 flags)
+{
+  struct v4l2_event_subscription argp;
+
+  GST_DEBUG_OBJECT (v4l2object->element,
+      "trying to subscribe to event %d (id: %u flags: 0x%08x)", type, id,
+      flags);
+
+  memset (&argp, 0, sizeof (argp));
 
   if (!GST_V4L2_IS_OPEN (v4l2object))
     return FALSE;
 
-  ret = v4l2object->ioctl (v4l2object->video_fd, VIDIOC_SUBSCRIBE_EVENT, &sub);
-  if (ret < 0)
-    goto failed;
+  argp.type = type;
+  argp.id = id;
+  argp.flags = flags;
+
+  if (v4l2object->ioctl (v4l2object->video_fd, VIDIOC_SUBSCRIBE_EVENT,
+          &argp) < 0)
+    goto subscribe_failed;
 
   return TRUE;
 
   /* ERRORS */
-failed:
-  {
-    if (errno == ENOTTY || errno == EINVAL) {
-      GST_DEBUG_OBJECT (v4l2object->dbg_obj,
-          "Cannot subscribe to '%s' event: %s",
-          gst_v4l2_event_to_string (event), "not supported");
-    } else {
-      GST_ERROR_OBJECT (v4l2object->dbg_obj,
-          "Cannot subscribe to '%s' event: %s",
-          gst_v4l2_event_to_string (event), g_strerror (errno));
-    }
+subscribe_failed:
+  GST_ELEMENT_WARNING (v4l2object->element, RESOURCE, SETTINGS,
+      (_("Failed to subscribe to event %d on device %s."),
+          type, v4l2object->videodev), GST_ERROR_SYSTEM);
+  return FALSE;
+}
+
+gboolean
+gst_v4l2_dqevent (GstV4l2Object * v4l2object, struct v4l2_event * event)
+{
+  g_return_val_if_fail (event, FALSE);
+
+  if (!GST_V4L2_IS_OPEN (v4l2object))
     return FALSE;
-  }
+
+  if (v4l2object->ioctl (v4l2object->video_fd, VIDIOC_DQEVENT, event) < 0)
+    goto dqevent_failed;
+
+  return TRUE;
+
+  /* ERRORS */
+dqevent_failed:
+  GST_ELEMENT_WARNING (v4l2object->element, RESOURCE, SETTINGS,
+      (_("Failed to dequeue event on device %s."),
+          v4l2object->videodev), GST_ERROR_SYSTEM);
+  return FALSE;
 }
 
 gboolean

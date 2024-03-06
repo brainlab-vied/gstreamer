@@ -1,4 +1,5 @@
 v4l2_sources = [
+  'edid-utils.c',
   'gstv4l2.c',
   'gstv4l2element.c',
   'gstv4l2allocator.c',
@@ -7,6 +8,8 @@ v4l2_sources = [
   'gstv4l2deviceprovider.c',
   'gstv4l2object.c',
   'gstv4l2bufferpool.c',
+  'gstv4l2capturebufferpool.c',
+  'gstv4l2media.c',
   'gstv4l2sink.c',
   'gstv4l2src.c',
   'gstv4l2radio.c',
@@ -29,11 +32,15 @@ v4l2_sources = [
   'gstv4l2vp8enc.c',
   'gstv4l2vp9codec.c',
   'gstv4l2vp9enc.c',
+  'gstxilinxscd.c',
+  'gstxlnxabrscaler.c',
+  'subdev-utils.c',
   'v4l2_calls.c',
   'v4l2-utils.c',
   'tuner.c',
   'tunerchannel.c',
-  'tunernorm.c'
+  'tunernorm.c',
+  'ext/xlnx-ll/xvfbsync.c',
 ]
 
 v4l2 = get_option('v4l2')
@@ -64,7 +71,7 @@ if have_v4l2
     v4l2_sources,
     c_args : gst_plugins_good_args,
     include_directories : [configinc, libsinc],
-    dependencies : [gstbase_dep, gstvideo_dep, gstallocators_dep, gudev_dep, libv4l2_dep],
+    dependencies : [gstbase_dep, gstvideo_dep, gstallocators_dep, gudev_dep, libv4l2_dep, dependency('threads')],
     install : true,
     install_dir : plugins_install_dir,
   )

@@ -1,0 +1,11 @@
+--- subprojects/gst-plugins-good/sys/v4l2/gstv4l2object.c	2024-02-27 16:56:02.602323554 +0100
++++ subprojects/gst-plugins-good/sys/v4l2/gstv4l2object.c	2024-02-27 17:20:31.755784002 +0100
+@@ -3508,6 +3638,8 @@
+     case GST_VIDEO_FORMAT_NV16:
+     case GST_VIDEO_FORMAT_NV61:
+     case GST_VIDEO_FORMAT_NV24:
++    case GST_VIDEO_FORMAT_NV12_10LE32:
++    case GST_VIDEO_FORMAT_NV16_10LE32:
+       estride = (plane == 0 ? 1 : 2) *
+           GST_VIDEO_FORMAT_INFO_SCALE_WIDTH (finfo, plane, stride);
+       break;

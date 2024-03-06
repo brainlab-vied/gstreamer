@@ -26,6 +26,7 @@
 
 #include <gstv4l2object.h>
 #include <gstv4l2bufferpool.h>
+#include <gst/video/video.h>
 
 G_BEGIN_DECLS
 
@@ -54,6 +55,7 @@ struct _GstV4l2Src
 
   /*< private >*/
   GstV4l2Object * v4l2object;
+  GData * subdevs;
 
   guint64 offset;
   gboolean next_offset_same;
@@ -78,9 +80,18 @@ struct _GstV4l2Src
   /* Timestamp sanity check */
   GstClockTime last_timestamp;
   gboolean has_bad_timestamp;
+  gboolean has_monotonic_clock;
 
   /* maintain signal status, updated during negotiation */
   gboolean no_signal;
+
+  /* TRUE if using Xilinx low latency capture */
+  gboolean xlnx_ll;
+
+  /* For HDR10 support */
+  GstVideoMasteringDisplayInfo minfo;
+  GstVideoContentLightLevel cinfo;
+  gboolean is_hdr_supported;
 };
 
 struct _GstV4l2SrcClass

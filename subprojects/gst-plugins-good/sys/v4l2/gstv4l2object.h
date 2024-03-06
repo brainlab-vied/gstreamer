@@ -24,7 +24,9 @@
 #ifndef __GST_V4L2_OBJECT_H__
 #define __GST_V4L2_OBJECT_H__
 
+#include "ext/hdr-ctrls.h"
 #include "ext/videodev2.h"
+#include "ext/xlnx-ll/xvfbsync.h"
 #ifdef HAVE_LIBV4L2
 #  include <libv4l2.h>
 #endif
@@ -46,8 +48,8 @@ typedef struct _GstV4l2ObjectClassHelper GstV4l2ObjectClassHelper;
 #define GST_V4L2_MIN_BUFFERS(obj) \
     ((GST_VIDEO_INFO_INTERLACE_MODE (&obj->info) == \
       GST_VIDEO_INTERLACE_MODE_ALTERNATE) ? \
-      /* 2x buffers needed with each field in its own buffer */ \
-      4 : 2)
+      /* FIXME: increase buffers to 4x, workaround for buffer underrun issue */ \
+      8 : 2)
 
 /* max frame width/height */
 #define GST_V4L2_MAX_SIZE (1<<15) /* 2^15 == 32768 */
@@ -199,6 +201,7 @@ struct _GstV4l2Object {
   gulong frequency;
   GstStructure *extra_controls;
   gboolean keep_aspect;
+  gboolean force_ntsc_tv;
   GValue *par;
 
   /* funcs */
@@ -226,6 +229,15 @@ struct _GstV4l2Object {
    * on slow USB firmwares. When this is set, gst_v4l2_set_format() will modify
    * the caps to reflect what was negotiated during fixation */
   gboolean skip_try_fmt_probes;
+
+  /* Stride alignment */
+  guint32 stride_align;
+  /* For Xilinx Low Latency */
+  gboolean xlnx_ll;
+  gboolean xlnx_ll_dma_started;
+  SyncIp syncip;
+  SyncChannel sync_chan;
+  EncSyncChannel enc_sync_chan;
 };
 
 struct _GstV4l2ObjectClassHelper {
@@ -250,7 +262,9 @@ GType gst_v4l2_object_get_type (void);
     PROP_CAPTURE_IO_MODE,     \
     PROP_EXTRA_CONTROLS,      \
     PROP_PIXEL_ASPECT_RATIO,  \
-    PROP_FORCE_ASPECT_RATIO
+    PROP_FORCE_ASPECT_RATIO,  \
+    PROP_FORCE_NTSC_TV,       \
+    PROP_STRIDE_ALIGNMENT
 
 /* create/destroy */
 GstV4l2Object*  gst_v4l2_object_new       (GstElement * element,
@@ -277,10 +291,16 @@ gboolean     gst_v4l2_object_set_property_helper       (GstV4l2Object * v4l2obje
 gboolean     gst_v4l2_object_get_property_helper       (GstV4l2Object *v4l2object,
                                                         guint prop_id, GValue * value,
                                                         GParamSpec * pspec);
+
+void         gst_v4l2_object_set_device      (GstV4l2Object *v4l2object, const gchar * device);
+
 /* open/close */
 gboolean     gst_v4l2_object_open            (GstV4l2Object * v4l2object, GstV4l2Error * error);
 gboolean     gst_v4l2_object_open_shared     (GstV4l2Object * v4l2object, GstV4l2Object * other);
 gboolean     gst_v4l2_object_close           (GstV4l2Object * v4l2object);
+
+gboolean     gst_v4l2_object_get_exclusive_lock (GstV4l2Object *v4l2object);
+gboolean     gst_v4l2_object_release_exclusive_lock (GstV4l2Object *v4l2object);
 
 /* probing */
 
@@ -359,8 +379,14 @@ gboolean     gst_v4l2_set_string_attribute (GstV4l2Object * v4l2object, int attr
 gboolean     gst_v4l2_set_controls    (GstV4l2Object * v4l2object, GstStructure * controls);
 
 /* events */
-gboolean     gst_v4l2_subscribe_event (GstV4l2Object * v4l2object, guint32 event, guint32 id);
 gboolean     gst_v4l2_dequeue_event   (GstV4l2Object * v4l2object, struct v4l2_event *event);
+gboolean     gst_v4l2_subscribe_event (GstV4l2Object * v4l2object,
+                                         guint32 type,
+                                         guint32 id,
+                                         guint flags);
+
+gboolean     gst_v4l2_dqevent (GstV4l2Object * v4l2object, struct v4l2_event * event);
+
 
 G_END_DECLS
 

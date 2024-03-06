@@ -53,9 +53,14 @@
 
 #include <gst/video/gstvideometa.h>
 #include <gst/video/gstvideopool.h>
+#include "edid-utils.h"
 
 #include "gstv4l2elements.h"
 #include "gstv4l2src.h"
+#include "gstv4l2media.h"
+#include "gstv4l2object.h"
+#include "subdev-utils.h"
+#include "ext/media.h"
 
 #include "gstv4l2colorbalance.h"
 #include "gstv4l2tuner.h"
@@ -67,6 +72,11 @@ GST_DEBUG_CATEGORY (v4l2src_debug);
 #define GST_CAT_DEFAULT v4l2src_debug
 
 #define DEFAULT_PROP_DEVICE   "/dev/video0"
+/* For Xilinx Specific IPs */
+#define ENTITY_HDMI_SUFFIX    "v_hdmi_rx_ss"
+#define ENTITY_SCD_PREFIX     "xlnx-scdchan"
+#define ENTITY_SDI_SUFFIX     "v_smpte_uhdsdi_rx_ss"
+#define SCD_EVENT_TYPE        0x08000301
 
 enum
 {
@@ -134,6 +144,7 @@ static GstFlowReturn gst_v4l2src_create (GstPushSrc * src, GstBuffer ** out);
 static GstCaps *gst_v4l2src_fixate (GstBaseSrc * basesrc, GstCaps * caps,
     struct PreferredCapsInfo *pref);
 static gboolean gst_v4l2src_negotiate (GstBaseSrc * basesrc);
+static gboolean gst_v4l2src_event (GstBaseSrc * basesrc, GstEvent * event);
 
 static void gst_v4l2src_set_property (GObject * object, guint prop_id,
     const GValue * value, GParamSpec * pspec);
@@ -147,6 +158,8 @@ gst_v4l2src_class_init (GstV4l2SrcClass * klass)
   GstElementClass *element_class;
   GstBaseSrcClass *basesrc_class;
   GstPushSrcClass *pushsrc_class;
+  GstCaps *caps, *caps_xlnx_ll;
+  guint i;
 
   gobject_class = G_OBJECT_CLASS (klass);
   element_class = GST_ELEMENT_CLASS (klass);
@@ -260,10 +273,35 @@ gst_v4l2src_class_init (GstV4l2SrcClass * klass)
       "Edgard Lima <edgard.lima@gmail.com>, "
       "Stefan Kost <ensonic@users.sf.net>");
 
+  caps = gst_v4l2_object_get_all_caps ();
+  /* We don't own caps */
+  caps = gst_caps_copy (caps);
+  caps_xlnx_ll = gst_caps_new_empty ();
+
+  for (i = 0; i < gst_caps_get_size (caps); i++) {
+    GstStructure *s = gst_caps_get_structure (caps, i);
+
+    if (gst_structure_has_name (s, "video/x-raw")) {
+      GstCapsFeatures *features;
+
+      features = gst_caps_get_features (caps, i);
+      features = gst_caps_features_copy (features);
+      gst_caps_features_remove (features,
+          GST_CAPS_FEATURE_MEMORY_SYSTEM_MEMORY);
+      gst_caps_features_add (features, GST_CAPS_FEATURE_MEMORY_XLNX_LL);
+
+      gst_caps_append_structure_full (caps_xlnx_ll, gst_structure_copy (s),
+          features);
+    }
+  }
+
+  caps = gst_caps_merge (caps, caps_xlnx_ll);
+
   gst_element_class_add_pad_template
       (element_class,
-      gst_pad_template_new ("src", GST_PAD_SRC, GST_PAD_ALWAYS,
-          gst_v4l2_object_get_all_caps ()));
+      gst_pad_template_new ("src", GST_PAD_SRC, GST_PAD_ALWAYS, caps));
+
+  gst_caps_unref (caps);
 
   basesrc_class->get_caps = GST_DEBUG_FUNCPTR (gst_v4l2src_get_caps);
   basesrc_class->start = GST_DEBUG_FUNCPTR (gst_v4l2src_start);
@@ -274,6 +312,7 @@ gst_v4l2src_class_init (GstV4l2SrcClass * klass)
   basesrc_class->negotiate = GST_DEBUG_FUNCPTR (gst_v4l2src_negotiate);
   basesrc_class->decide_allocation =
       GST_DEBUG_FUNCPTR (gst_v4l2src_decide_allocation);
+  basesrc_class->event = GST_DEBUG_FUNCPTR (gst_v4l2src_event);
 
   pushsrc_class->create = GST_DEBUG_FUNCPTR (gst_v4l2src_create);
 
@@ -293,8 +332,14 @@ gst_v4l2src_init (GstV4l2Src * v4l2src)
   /* Avoid the slow probes */
   v4l2src->v4l2object->skip_try_fmt_probes = TRUE;
 
+  g_datalist_init (&v4l2src->subdevs);
+
   gst_base_src_set_format (GST_BASE_SRC (v4l2src), GST_FORMAT_TIME);
   gst_base_src_set_live (GST_BASE_SRC (v4l2src), TRUE);
+
+  gst_video_mastering_display_info_init (&v4l2src->minfo);
+  gst_video_content_light_level_init (&v4l2src->cinfo);
+  v4l2src->is_hdr_supported = TRUE;
 }
 
 
@@ -302,6 +347,7 @@ static void
 gst_v4l2src_finalize (GstV4l2Src * v4l2src)
 {
   gst_v4l2_object_destroy (v4l2src->v4l2object);
+  g_datalist_clear (&v4l2src->subdevs);
 
   G_OBJECT_CLASS (parent_class)->finalize ((GObject *) (v4l2src));
 }
@@ -498,12 +544,42 @@ gst_v4l2src_set_format (GstV4l2Src * v4l2src, GstCaps * caps,
     GstV4l2Error * error)
 {
   GstV4l2Object *obj;
+  GstV4l2Subdev *v4l2subdev;
 
   obj = v4l2src->v4l2object;
 
   /* make sure we stop capturing and dealloc buffers */
   if (!gst_v4l2_object_stop (obj))
     return FALSE;
+
+  v4l2subdev =
+      (GstV4l2Subdev *) g_datalist_get_data (&v4l2src->subdevs,
+      ENTITY_SDI_SUFFIX);
+  if (v4l2subdev) {
+    GstVideoColorimetry ci = { 0, };
+    struct v4l2_subdev_format fmt;
+    gint ret;
+
+    fmt.pad = 0;
+    fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+
+    ret = gst_v4l2_subdev_g_fmt (v4l2subdev, &fmt);
+    if (ret)
+      ret = gst_v4l2_subdev_get_colorspace (&fmt, &ci);
+
+    if (ret
+        && !gst_structure_get_string (gst_caps_get_structure (caps, 0),
+            "colorimetry")) {
+      gchar *colorimetry_str = gst_video_colorimetry_to_string (&ci);
+
+      gst_caps_set_simple (caps, "colorimetry", G_TYPE_STRING,
+          colorimetry_str, NULL);
+      GST_DEBUG_OBJECT (v4l2src,
+          "No colorimetry info in caps. Forcing colorimetry to %s",
+          colorimetry_str);
+      g_free (colorimetry_str);
+    }
+  }
 
   g_signal_emit (v4l2src, gst_v4l2_signals[SIGNAL_PRE_SET_FORMAT], 0,
       v4l2src->v4l2object->video_fd, caps);
@@ -565,28 +641,33 @@ gst_v4l2src_fixate (GstBaseSrc * basesrc, GstCaps * caps,
 
     fcaps = gst_caps_copy_nth (caps, i);
 
-    /* try hard to avoid TRY_FMT since some UVC camera just crash when this
-     * is called at run-time. */
-    if (gst_v4l2_object_caps_is_subset (obj, fcaps)) {
-      gst_caps_unref (fcaps);
-      fcaps = gst_v4l2_object_get_current_caps (obj);
-      break;
-    }
-
-    /* Just check if the format is acceptable, once we know
-     * no buffers should be outstanding we try S_FMT.
-     *
-     * Basesrc will do an allocation query that
-     * should indirectly reclaim buffers, after that we can
-     * set the format and then configure our pool */
-    if (gst_v4l2_object_try_format (obj, fcaps, &error)) {
-      /* make sure the caps changed before doing anything */
-      if (gst_v4l2_object_caps_equal (obj, fcaps))
+    if (GST_V4L2_IS_ACTIVE (obj)) {
+      /* try hard to avoid TRY_FMT since some UVC camera just crash when this
+       * is called at run-time. */
+      if (gst_v4l2_object_caps_is_subset (obj, fcaps)) {
+        gst_caps_unref (fcaps);
+        fcaps = gst_v4l2_object_get_current_caps (obj);
         break;
+      }
 
-      v4l2src->renegotiation_adjust = v4l2src->offset + 1;
-      v4l2src->pending_set_fmt = TRUE;
-      break;
+      /* Just check if the format is acceptable, once we know
+       * no buffers should be outstanding we try S_FMT.
+       *
+       * Basesrc will do an allocation query that
+       * should indirectly reclaim buffers, after that we can
+       * set the format and then configure our pool */
+      if (gst_v4l2_object_try_format (obj, fcaps, &error)) {
+        /* make sure the caps changed before doing anything */
+        if (gst_v4l2_object_caps_equal (obj, fcaps))
+          break;
+
+        v4l2src->renegotiation_adjust = v4l2src->offset + 1;
+        v4l2src->pending_set_fmt = TRUE;
+        break;
+      }
+    } else {
+      if (gst_v4l2src_set_format (v4l2src, fcaps, &error))
+        break;
     }
 
     /* Only EIVAL make sense, report any other errors, this way we don't keep
@@ -612,6 +693,7 @@ gst_v4l2src_fixate (GstBaseSrc * basesrc, GstCaps * caps,
 
   return fcaps;
 }
+
 
 static gboolean
 gst_v4l2src_query_preferred_dv_timings (GstV4l2Src * v4l2src,
@@ -757,7 +839,7 @@ gst_v4l2src_setup_source_crop (GstV4l2Src * v4l2src,
 static gboolean
 gst_v4l2src_negotiate (GstBaseSrc * basesrc)
 {
-  GstV4l2Src *v4l2src = GST_V4L2SRC (basesrc);
+  GstV4l2Src *v4l2src;
   GstCaps *thiscaps;
   GstCaps *caps = NULL;
   GstCaps *peercaps = NULL;
@@ -767,6 +849,8 @@ gst_v4l2src_negotiate (GstBaseSrc * basesrc)
     3840, 2160, 120, 1
   };
   gboolean have_pref;
+
+  v4l2src = GST_V4L2SRC (basesrc); 
 
   /* For drivers that has DV timings or other default size query
    * capabilities, we will prefer that resolution. This must happen before we
@@ -875,6 +959,8 @@ gst_v4l2src_decide_allocation (GstBaseSrc * bsrc, GstQuery * query)
   GstV4l2Src *src = GST_V4L2SRC (bsrc);
   GstBufferPool *bpool = gst_v4l2_object_get_buffer_pool (src->v4l2object);
   gboolean ret = TRUE;
+  GstStructure *config;
+  guint nb_buffers;
 
   if (src->pending_set_fmt) {
     GstCaps *caps = gst_pad_get_current_caps (GST_BASE_SRC_PAD (bsrc));
@@ -939,6 +1025,20 @@ gst_v4l2src_decide_allocation (GstBaseSrc * bsrc, GstQuery * query)
     if (!gst_buffer_pool_set_active (bpool, TRUE))
       goto activate_failed;
   }
+
+  config = gst_buffer_pool_get_config (bpool);
+  if (gst_buffer_pool_config_get_params (config, NULL, NULL, &nb_buffers, NULL)) {
+    GstEvent *event;
+
+    event =
+        gst_event_new_custom (GST_EVENT_CUSTOM_DOWNSTREAM,
+        gst_structure_new ("buffers-allocated",
+            "nb-buffers", G_TYPE_UINT, nb_buffers,
+            "pool", GST_TYPE_BUFFER_POOL, bpool, NULL));
+
+    gst_pad_push_event (GST_BASE_SRC_PAD (src), event);
+  }
+  gst_structure_free (config);
 
   if (bpool)
     gst_object_unref (bpool);
@@ -1008,6 +1108,9 @@ gst_v4l2src_query (GstBaseSrc * bsrc, GstQuery * query)
       else
         max_latency = num_buffers * min_latency;
 
+      if (src->v4l2object->xlnx_ll)
+        min_latency = GST_MSECOND;
+
       GST_DEBUG_OBJECT (bsrc,
           "report latency min %" GST_TIME_FORMAT " max %" GST_TIME_FORMAT,
           GST_TIME_ARGS (min_latency), GST_TIME_ARGS (max_latency));
@@ -1049,6 +1152,9 @@ gst_v4l2src_start (GstBaseSrc * src)
   v4l2src->has_bad_timestamp = FALSE;
   v4l2src->last_timestamp = 0;
 
+  v4l2src->v4l2object->xlnx_ll = FALSE;
+  v4l2src->v4l2object->xlnx_ll_dma_started = FALSE;
+
   return TRUE;
 }
 
@@ -1080,9 +1186,152 @@ gst_v4l2src_stop (GstBaseSrc * src)
       return FALSE;
   }
 
+
   v4l2src->pending_set_fmt = FALSE;
 
   return TRUE;
+}
+
+static GstV4l2MediaInterface *
+find_subdev (GstV4l2Media * media, GstV4l2MediaEntity * entity,
+    const gchar * prefix, const gchar * suffix)
+{
+  GstV4l2MediaInterface *subdev;
+  GList *l;
+
+  if (prefix && !g_str_has_prefix (entity->name, prefix))
+    return NULL;
+
+  if (suffix && !g_str_has_suffix (entity->name, suffix))
+    return NULL;
+
+  l = gst_v4l2_media_find_interfaces_linked_with_entity (media, entity,
+      MEDIA_INTF_T_V4L_SUBDEV);
+
+  if (!l)
+    return FALSE;
+  subdev = l->data;
+  g_list_free (l);
+  return subdev;
+}
+
+static gboolean
+gst_v4l2_try_opening_subdevice (GstV4l2Src * self, const gchar * subdev,
+    const gchar * key)
+{
+  /* v4l2 subdev */
+  GstV4l2Subdev *v4l2subdev = gst_v4l2_subdev_new (self->v4l2object);
+
+  gst_v4l2_object_set_device (v4l2subdev->subdev, subdev);
+  if (!gst_v4l2_object_open (v4l2subdev->subdev, NULL))
+    goto failed;
+  g_datalist_set_data_full (&self->subdevs, key, v4l2subdev,
+      gst_v4l2_subdev_free_gpointer);
+
+  return TRUE;
+
+failed:
+  if (GST_V4L2_IS_OPEN (v4l2subdev->subdev))
+    gst_v4l2_object_close (v4l2subdev->subdev);
+  gst_v4l2_subdev_free (v4l2subdev);
+
+  return FALSE;
+}
+
+static gboolean
+gst_v4l2_setup_subdev_poll (GstV4l2Src * self, const gchar * key)
+{
+  GstV4l2Subdev *v4l2subdev = g_datalist_get_data (&self->subdevs, key);
+
+  v4l2subdev->poll_fd.fd = v4l2subdev->subdev->video_fd;
+  gst_poll_add_fd (v4l2subdev->event_poll, &v4l2subdev->poll_fd);
+  gst_poll_fd_ctl_pri (v4l2subdev->event_poll, &v4l2subdev->poll_fd, TRUE);
+
+  if (!g_strcmp0 (key, ENTITY_SCD_PREFIX)) {
+    if (!gst_v4l2_subscribe_event (v4l2subdev->subdev, SCD_EVENT_TYPE, 0, 0)) {
+      if (GST_V4L2_IS_OPEN (v4l2subdev->subdev)) {
+        gst_v4l2_object_close (v4l2subdev->subdev);
+      }
+      return FALSE;
+    }
+  } else if (!g_strcmp0 (key, ENTITY_SDI_SUFFIX)) {
+    if (!gst_v4l2_subscribe_event (v4l2subdev->subdev, V4L2_EVENT_SOURCE_CHANGE,
+            0, 0)) {
+      if (GST_V4L2_IS_OPEN (v4l2subdev->subdev)) {
+        gst_v4l2_object_close (v4l2subdev->subdev);
+      }
+      return FALSE;
+    }
+  } else {
+    GST_WARNING_OBJECT (self, "Polling event not supporting for %s", key);
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+static gboolean
+gst_v4l2_find_subdev (GstV4l2Src * self, const gchar * prefix,
+    const gchar * suffix)
+{
+  GstV4l2Media *media;
+  GList *entities = NULL, *l;
+  gchar *media_node = NULL;
+  gboolean result = FALSE;
+
+  if (!(media_node =
+          gst_v4l2_media_get_device_file (self->v4l2object->videodev)))
+    return FALSE;
+
+  GST_DEBUG_OBJECT (self, "Using media node %s for searching subdev",
+      media_node);
+  media = gst_v4l2_media_new (media_node);
+
+  if (!gst_v4l2_media_open (media))
+    goto out;
+
+  if (!gst_v4l2_media_refresh_topology (media))
+    goto out;
+
+  entities = gst_v4l2_media_get_entities (media);
+
+  for (l = entities; l && !result; l = g_list_next (l)) {
+    GstV4l2MediaEntity *entity = l->data;
+    GstV4l2MediaInterface *subdev;
+    gchar *subdev_file;
+
+    subdev = find_subdev (media, entity, prefix, suffix);
+    if (!subdev)
+      continue;
+
+    subdev_file = gst_v4l2_media_get_interface_device_file (media, subdev);
+
+    GST_DEBUG_OBJECT (self, "subdev '%s' (%s)", entity->name, subdev_file);
+
+    if (prefix)
+      result = gst_v4l2_try_opening_subdevice (self, subdev_file, prefix);
+    else
+      result = gst_v4l2_try_opening_subdevice (self, subdev_file, suffix);
+
+    g_free (subdev_file);
+  }
+
+out:
+  g_free (media_node);
+  g_list_free (entities);
+  gst_v4l2_media_free (media);
+  return result;
+}
+
+static void
+close_subdev (GQuark key_id, gpointer data, gpointer user_data)
+{
+  GstV4l2Subdev *v4l2subdev = (GstV4l2Subdev *) data;
+
+  if (v4l2subdev->poll_fd.fd >= 0)
+    gst_poll_remove_fd (v4l2subdev->event_poll, &v4l2subdev->poll_fd);
+  if (GST_V4L2_IS_OPEN (v4l2subdev->subdev))
+    gst_v4l2_object_close (v4l2subdev->subdev);
 }
 
 static GstStateChangeReturn
@@ -1092,13 +1341,63 @@ gst_v4l2src_change_state (GstElement * element, GstStateChange transition)
   GstV4l2Src *v4l2src = GST_V4L2SRC (element);
   GstV4l2Object *obj = v4l2src->v4l2object;
   GstV4l2Error error = GST_V4L2_ERROR_INIT;
+  GstClock *clk = NULL;
 
   switch (transition) {
+    case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
+      v4l2src->has_monotonic_clock = FALSE;
+      clk = gst_element_get_clock (element);
+      if (clk) {
+        if (GST_IS_SYSTEM_CLOCK (clk)) {
+          GstClockType clocktype;
+          g_object_get (clk, "clock-type", &clocktype, NULL);
+          if (clocktype == GST_CLOCK_TYPE_MONOTONIC) {
+            GST_DEBUG_OBJECT (v4l2src, "clock is monotonic already");
+            v4l2src->has_monotonic_clock = TRUE;
+          }
+        }
+        gst_object_unref (clk);
+      }
+      break;
     case GST_STATE_CHANGE_NULL_TO_READY:
       /* open the device */
       if (!gst_v4l2_object_open (obj, &error)) {
         gst_v4l2_error (v4l2src, &error);
         return GST_STATE_CHANGE_FAILURE;
+      }
+
+      if (!gst_v4l2_find_subdev (v4l2src, NULL, ENTITY_HDMI_SUFFIX)) {
+        GST_DEBUG_OBJECT (v4l2src, "No HDMI subdev found");
+        v4l2src->is_hdr_supported = FALSE;
+      } else {
+        GstV4l2Subdev *v4l2subdev =
+            (GstV4l2Subdev *) g_datalist_get_data (&v4l2src->subdevs,
+            ENTITY_HDMI_SUFFIX);
+
+        GST_DEBUG_OBJECT (v4l2src, "HDMI subdev found");
+        if (!gst_edid_is_hdr10_supported (v4l2subdev->subdev)) {
+          GST_DEBUG_OBJECT (v4l2src,
+              "EDID does not have HDR10 EOTF support. Disabling HDR");
+          v4l2src->is_hdr_supported = FALSE;
+        }
+      }
+
+      if (!gst_v4l2_find_subdev (v4l2src, ENTITY_SCD_PREFIX, NULL)) {
+        GST_DEBUG_OBJECT (v4l2src, "No SCD subdev found");
+      } else {
+        GST_DEBUG_OBJECT (v4l2src, "SCD subdev found");
+        if (!gst_v4l2_setup_subdev_poll (v4l2src, ENTITY_SCD_PREFIX)) {
+          GST_DEBUG_OBJECT (v4l2src, "Unable to setup SCD subdev");
+        }
+      }
+
+      if (!gst_v4l2_find_subdev (v4l2src, NULL, ENTITY_SDI_SUFFIX)) {
+        GST_DEBUG_OBJECT (v4l2src, "No SDI subdev found");
+      } else {
+        GST_DEBUG_OBJECT (v4l2src, "SDI subdev found");
+        if (!gst_v4l2_setup_subdev_poll (v4l2src, ENTITY_SDI_SUFFIX)) {
+          GST_DEBUG_OBJECT (v4l2src, "Unable to setup SDI subdev");
+        }
       }
       break;
     default:
@@ -1112,6 +1411,8 @@ gst_v4l2src_change_state (GstElement * element, GstStateChange transition)
       /* close the device */
       if (!gst_v4l2_object_close (obj))
         return GST_STATE_CHANGE_FAILURE;
+
+      g_datalist_foreach (&v4l2src->subdevs, close_subdev, NULL);
 
       break;
     default:
@@ -1139,6 +1440,305 @@ gst_v4l2src_handle_resolution_change (GstV4l2Src * v4l2src)
 }
 
 static GstFlowReturn
+gst_v4l2_wait_event (GstV4l2Src * self, GstV4l2Subdev * v4l2subdev,
+    struct v4l2_event *event, guint event_type, GstClockTime timeout)
+{
+  gint wait_ret;
+  gboolean error = FALSE;
+
+again:
+  GST_LOG_OBJECT (self, "waiting for event of type %d", event_type);
+  wait_ret = gst_poll_wait (v4l2subdev->event_poll, timeout);
+  if (G_UNLIKELY (wait_ret < 0)) {
+    switch (errno) {
+      case EBUSY:
+        GST_DEBUG_OBJECT (self, "stop called");
+        return GST_FLOW_FLUSHING;
+      case EAGAIN:
+      case EINTR:
+        goto again;
+      default:
+        error = TRUE;
+    }
+  }
+
+  if (!wait_ret) {
+    GST_DEBUG_OBJECT (self, "No event occurred before timeout");
+    return GST_FLOW_OK;
+  }
+
+  if (error
+      || gst_poll_fd_has_error (v4l2subdev->event_poll, &v4l2subdev->poll_fd)) {
+    GST_ELEMENT_ERROR (self, RESOURCE, READ, (NULL), ("poll error: %s (%d)",
+            g_strerror (errno), errno));
+    return GST_FLOW_ERROR;
+  }
+
+  if (!gst_v4l2_dqevent (v4l2subdev->subdev, event)) {
+    GST_ELEMENT_ERROR (self, RESOURCE, READ, (NULL),
+        ("Failed to dqueue event"));
+    return GST_FLOW_ERROR;
+  }
+
+  if (event->type != event_type) {
+    GST_WARNING_OBJECT (self, "Received wrong type of event: %d (expected: %d)",
+        event->type, event_type);
+    goto again;
+  }
+
+  return GST_FLOW_OK;
+}
+
+static GstFlowReturn
+gst_v4l2src_poll_subdevs (GstV4l2Src * self)
+{
+  GstV4l2Subdev *v4l2subdev;
+
+  /* SCD event */
+  v4l2subdev =
+      (GstV4l2Subdev *) g_datalist_get_data (&self->subdevs, ENTITY_SCD_PREFIX);
+  if (v4l2subdev) {
+    struct v4l2_event event;
+    guint8 sc_detected;
+    GstFlowReturn ret;
+
+    ret =
+        gst_v4l2_wait_event (self, v4l2subdev, &event, SCD_EVENT_TYPE,
+        GST_CLOCK_TIME_NONE);
+    if (G_UNLIKELY (ret != GST_FLOW_OK))
+      return ret;
+
+    sc_detected = event.u.data[0];
+    GST_LOG_OBJECT (self, "Received SCD event with data %d", sc_detected);
+
+    if (sc_detected) {
+      GstEvent *scd_event;
+      GstStructure *s;
+
+      GST_DEBUG_OBJECT (self, "scene change detected; sending event");
+
+      s = gst_structure_new ("omx-alg/scene-change",
+          "look-ahead", G_TYPE_UINT, 0, NULL);
+
+      scd_event = gst_event_new_custom (GST_EVENT_CUSTOM_DOWNSTREAM, s);
+
+      gst_pad_push_event (GST_BASE_SRC_PAD (self), scd_event);
+    }
+  }
+
+  /* SDI resolution change */
+  v4l2subdev =
+      (GstV4l2Subdev *) g_datalist_get_data (&self->subdevs, ENTITY_SDI_SUFFIX);
+  if (v4l2subdev) {
+    GstVideoColorimetry ci = { 0, };
+    struct v4l2_event event;
+    struct v4l2_subdev_format fmt;
+    GstFlowReturn ret;
+    GstCaps *cur_caps = NULL, *new_caps = NULL;
+
+    ret =
+        gst_v4l2_wait_event (self, v4l2subdev, &event,
+        V4L2_EVENT_SOURCE_CHANGE, 0);
+    if (G_UNLIKELY (ret != GST_FLOW_OK))
+      return ret;
+
+    fmt.pad = 0;
+    fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+
+    ret = gst_v4l2_subdev_g_fmt (v4l2subdev, &fmt);
+    if (ret)
+      ret = gst_v4l2_subdev_get_colorspace (&fmt, &ci);
+
+    cur_caps = gst_pad_get_current_caps (GST_BASE_SRC_PAD (self));
+    if (ret && cur_caps && (new_caps = gst_caps_copy (cur_caps))) {
+      gchar *colorimetry_str = gst_video_colorimetry_to_string (&ci);
+
+      if (g_strcmp0 (gst_structure_get_string (gst_caps_get_structure
+                  (cur_caps, 0), "colorimetry"), colorimetry_str)) {
+        gst_caps_set_simple (new_caps, "colorimetry", G_TYPE_STRING,
+            colorimetry_str, NULL);
+        gst_pad_set_caps (GST_BASE_SRC_PAD (self), new_caps);
+        GST_DEBUG_OBJECT (self, "SDI source change. Setting colorimetry to %s",
+            colorimetry_str);
+      }
+      g_free (colorimetry_str);
+    }
+
+    if (cur_caps)
+      gst_caps_unref (cur_caps);
+    if (new_caps)
+      gst_caps_unref (new_caps);
+  }
+
+  return GST_FLOW_OK;
+}
+
+static gboolean
+gst_v4l2src_get_controls (GstV4l2Src * self,
+    struct v4l2_ext_control *control, guint count)
+{
+  gint ret;
+  struct v4l2_ext_controls controls = {
+    .controls = control,
+    .count = count,
+  };
+
+  ret =
+      self->v4l2object->ioctl (self->v4l2object->video_fd, VIDIOC_G_EXT_CTRLS,
+      &controls);
+  if (ret < 0) {
+    GST_ERROR_OBJECT (self, "VIDIOC_G_EXT_CTRLS failed: %s",
+        g_strerror (errno));
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+/* Display primary order as per CTA 861.G 6.9.1 */
+static void
+gst_v4l2src_set_display_primaries (GstV4l2Src * self,
+    GstVideoMasteringDisplayInfo * minfo, struct v4l2_hdr10_payload *payload)
+{
+  gint i, largest_x = 0, largest_y = 0;
+  /* Payload indices of RGB primaries */
+  gint rgb_indices[3] = { -1, -1, -1 };
+
+  for (i = 0; i < 3; i++) {
+    /* Red has largest x display primary */
+    if (payload->display_primaries[i].x > largest_x) {
+      largest_x = payload->display_primaries[i].x;
+      if (rgb_indices[0] != -1 && rgb_indices[2] == -1)
+        rgb_indices[2] = rgb_indices[0];
+
+      rgb_indices[0] = i;
+    }
+
+    /* Green has largest y display primary */
+    if (payload->display_primaries[i].y > largest_y) {
+      largest_y = payload->display_primaries[i].y;
+      if (rgb_indices[1] != -1 && rgb_indices[2] == -1)
+        rgb_indices[2] = rgb_indices[1];
+
+      rgb_indices[1] = i;
+    }
+
+    /* Blue has neither */
+    if (payload->display_primaries[i].y <= largest_y
+        && payload->display_primaries[i].x <= largest_x)
+      rgb_indices[2] = i;
+  }
+
+  for (i = 0; i < 3; i++) {
+    minfo->display_primaries[i].x =
+        payload->display_primaries[rgb_indices[i]].x;
+    minfo->display_primaries[i].y =
+        payload->display_primaries[rgb_indices[i]].y;
+  }
+}
+
+static void
+gst_v4l2src_hdr_get_metadata (GstV4l2Src * self)
+{
+  struct v4l2_metadata_hdr ctrl_payload;
+  struct v4l2_hdr10_payload *payload;
+  struct v4l2_ext_control control[] = {
+    {
+          .id = V4L2_CID_METADATA_HDR,
+          .ptr = &ctrl_payload,
+          .size = sizeof (struct v4l2_metadata_hdr),
+        },
+  };
+  GstVideoMasteringDisplayInfo minfo;
+  GstVideoContentLightLevel cinfo;
+  GstCaps *cur_caps = NULL, *new_caps = NULL;
+  gboolean update_caps = FALSE;
+
+  gst_video_mastering_display_info_init (&minfo);
+  gst_video_content_light_level_init (&cinfo);
+
+  if (!gst_v4l2src_get_controls (self, control, 1)) {
+    self->is_hdr_supported = FALSE;
+    GST_ERROR_OBJECT (self, "Failed to get HDR metadata: %s",
+        g_strerror (errno));
+  } else {
+    if (ctrl_payload.metadata_type == V4L2_HDR_TYPE_HDR10) {
+      payload = (struct v4l2_hdr10_payload *) ctrl_payload.payload;
+
+      gst_v4l2src_set_display_primaries (self, &minfo, payload);
+      minfo.white_point.x = payload->white_point.x;
+      minfo.white_point.y = payload->white_point.y;
+      /* CTA 861.G is 1 candelas per square metre (cd/m^2) while
+       * GstVideoMasteringDisplayInfo is 0.0001 cd/m^2 */
+      minfo.max_display_mastering_luminance = payload->max_mdl * 10000;
+      minfo.min_display_mastering_luminance = payload->min_mdl;
+      GST_LOG_OBJECT (self, "Received mastering display info: "
+          "Red(%u, %u) "
+          "Green(%u, %u) "
+          "Blue(%u, %u) "
+          "White(%u, %u) "
+          "max_luminance(%u) "
+          "min_luminance(%u) ",
+          minfo.display_primaries[0].x, minfo.display_primaries[0].y,
+          minfo.display_primaries[1].x, minfo.display_primaries[1].y,
+          minfo.display_primaries[2].x, minfo.display_primaries[2].y,
+          minfo.white_point.x, minfo.white_point.y,
+          minfo.max_display_mastering_luminance,
+          minfo.min_display_mastering_luminance);
+
+      cinfo.max_content_light_level = payload->max_cll;
+      cinfo.max_frame_average_light_level = payload->max_fall;
+      GST_LOG_OBJECT (self, "Received content light level: "
+          "maxCLL:(%u), maxFALL:(%u)",
+          cinfo.max_content_light_level, cinfo.max_frame_average_light_level);
+
+      cur_caps = gst_pad_get_current_caps (GST_BASE_SRC_PAD (self));
+      if (cur_caps && (new_caps = gst_caps_copy (cur_caps))) {
+        if (payload->eotf == V4L2_EOTF_SMPTE_ST2084) {
+          if (g_strcmp0 (gst_structure_get_string (gst_caps_get_structure
+                      (cur_caps, 0), "colorimetry"),
+                  GST_VIDEO_COLORIMETRY_BT2100_PQ)) {
+            update_caps = TRUE;
+            gst_caps_set_simple (new_caps, "colorimetry", G_TYPE_STRING,
+                GST_VIDEO_COLORIMETRY_BT2100_PQ, NULL);
+          }
+
+          if (!gst_video_mastering_display_info_is_equal (&self->minfo, &minfo)) {
+            update_caps = TRUE;
+            self->minfo = minfo;
+            gst_video_mastering_display_info_add_to_caps (&self->minfo,
+                new_caps);
+          }
+
+          if (cinfo.max_content_light_level !=
+              self->cinfo.max_content_light_level
+              || cinfo.max_frame_average_light_level !=
+              self->cinfo.max_frame_average_light_level) {
+            update_caps = TRUE;
+            self->cinfo = cinfo;
+            gst_video_content_light_level_add_to_caps (&self->cinfo, new_caps);
+          }
+
+          if (update_caps)
+            gst_pad_set_caps (GST_BASE_SRC_PAD (self), new_caps);
+
+        } else {
+          GST_WARNING_OBJECT (self,
+              "Invalid EOTF was received: %u. HDR10 requires ST2086 EOTF.",
+              payload->eotf);
+        }
+        gst_caps_unref (cur_caps);
+        gst_caps_unref (new_caps);
+      }
+    } else {
+      GST_WARNING_OBJECT (self,
+          "VIDIOC_G_EXT_CTRLS returned invalid HDR metadata type: %u",
+          ctrl_payload.metadata_type);
+    }
+  }
+}
+
+static GstFlowReturn
 gst_v4l2src_create (GstPushSrc * src, GstBuffer ** buf)
 {
   GstV4l2Src *v4l2src = GST_V4L2SRC (src);
@@ -1150,6 +1750,8 @@ gst_v4l2src_create (GstPushSrc * src, GstBuffer ** buf)
   GstMessage *qos_msg;
   gboolean half_frame;
 
+  GstV4l2BufferPool *pool = GST_V4L2_BUFFER_POOL_CAST (obj->pool);
+start:
   do {
     ret = GST_BASE_SRC_CLASS (parent_class)->alloc (GST_BASE_SRC (src), 0,
         obj->info.size, buf);
@@ -1165,6 +1767,9 @@ gst_v4l2src_create (GstPushSrc * src, GstBuffer ** buf)
       }
       goto alloc_failed;
     }
+
+    if (v4l2src->is_hdr_supported)
+      gst_v4l2src_hdr_get_metadata (v4l2src);
 
     {
       GstV4l2BufferPool *obj_pool =
@@ -1187,8 +1792,28 @@ gst_v4l2src_create (GstPushSrc * src, GstBuffer ** buf)
   if (G_UNLIKELY (ret != GST_FLOW_OK))
     goto error;
 
+  ret = gst_v4l2src_poll_subdevs (v4l2src);
+  if (G_UNLIKELY (ret != GST_FLOW_OK))
+    return ret;
+ 
   timestamp = GST_BUFFER_TIMESTAMP (*buf);
   duration = obj->duration;
+
+  if (v4l2src->ctrl_time == 0
+      && (GST_VIDEO_INFO_INTERLACE_MODE (&pool->caps_info) ==
+          GST_VIDEO_INTERLACE_MODE_ALTERNATE)) {
+    if ((GST_VIDEO_INFO_FIELD_ORDER (&pool->caps_info) ==
+            GST_VIDEO_FIELD_ORDER_BOTTOM_FIELD_FIRST)
+        && (GST_VIDEO_BUFFER_IS_TOP_FIELD (*buf)) ||
+        ((GST_VIDEO_INFO_FIELD_ORDER (&pool->caps_info) ==
+                GST_VIDEO_FIELD_ORDER_TOP_FIELD_FIRST)
+            && (GST_VIDEO_BUFFER_IS_BOTTOM_FIELD (*buf)))) {
+      GST_WARNING_OBJECT (v4l2src, " Received inverted field, dropping");
+      gst_buffer_replace (buf, NULL);
+      v4l2src->ctrl_time = 1;
+      goto start;
+    }
+  }
 
   /* timestamps, LOCK to get clock and base time. */
   /* FIXME: element clock and base_time is rarely changing */
@@ -1214,13 +1839,20 @@ gst_v4l2src_create (GstPushSrc * src, GstBuffer ** buf)
 retry:
   if (!v4l2src->has_bad_timestamp && timestamp != GST_CLOCK_TIME_NONE) {
     struct timespec now;
-    GstClockTime gstnow;
+    GstClockTime gstnow = GST_CLOCK_TIME_NONE;
 
     /* v4l2 specs say to use the system time although many drivers switched to
      * the more desirable monotonic time. We first try to use the monotonic time
      * and see how that goes */
-    clock_gettime (CLOCK_MONOTONIC, &now);
-    gstnow = GST_TIMESPEC_TO_TIME (now);
+    if (v4l2src->has_monotonic_clock)
+      gstnow = abs_time;
+
+    if (!GST_CLOCK_TIME_IS_VALID (gstnow)) {
+      clock_gettime (CLOCK_MONOTONIC, &now);
+      gstnow = GST_TIMESPEC_TO_TIME (now);
+      GST_DEBUG_OBJECT (v4l2src,
+          "Element clock is non-monotonic, using system monotonic clock");
+    }
 
     if (timestamp > gstnow || (gstnow - timestamp) > (10 * GST_SECOND)) {
       /* very large diff, fall back to system time */
@@ -1430,4 +2062,56 @@ gst_v4l2src_uri_handler_init (gpointer g_iface, gpointer iface_data)
   iface->get_protocols = gst_v4l2src_uri_get_protocols;
   iface->get_uri = gst_v4l2src_uri_get_uri;
   iface->set_uri = gst_v4l2src_uri_set_uri;
+}
+
+static void
+start_xilinx_dma (GstV4l2Src * self)
+{
+  struct v4l2_control control = { 0, };
+  control.id = V4L2_CID_XILINX_LOW_LATENCY;
+  control.value = XVIP_START_DMA;
+
+  if (self->v4l2object->ioctl (self->v4l2object->video_fd, VIDIOC_S_CTRL,
+          &control)) {
+    GST_ERROR_OBJECT (self, "Failed to start DMA: %s", g_strerror (errno));
+  } else {
+    self->v4l2object->xlnx_ll_dma_started = true;
+    GST_INFO_OBJECT (self, "XLNXLL: DMA started:");
+  }
+}
+
+static gboolean
+gst_v4l2src_event (GstBaseSrc * basesrc, GstEvent * event)
+{
+  GstV4l2Src *self = GST_V4L2SRC (basesrc);
+
+  switch (GST_EVENT_TYPE (event)) {
+    case GST_EVENT_CUSTOM_UPSTREAM:
+    {
+      if (gst_event_has_name (event, "xlnx-ll-consumer-ready")) {
+        if (self->v4l2object->xlnx_ll) {
+          GST_DEBUG_OBJECT (self, "XLNX-LowLatency consumer ready, start DMA");
+          start_xilinx_dma (self);
+        } else {
+          GST_WARNING_OBJECT (self,
+              "Received XLNX-LowLatency consumer ready event in normal mode; ignoring");
+        }
+        return TRUE;
+      } else if (gst_event_has_name (event, "xlnx-ll-reset-slot")) {
+        if (self->v4l2object->xlnx_ll) {
+          xvfbsync_enc_sync_reset_slot (&self->v4l2object->enc_sync_chan);
+        } else {
+          GST_WARNING_OBJECT (self,
+              "Received reset slot event in normal mode, ignoring");
+        }
+
+        return TRUE;
+      }
+    }
+
+    default:
+      break;
+  }
+
+  return GST_BASE_SRC_CLASS (gst_v4l2src_parent_class)->event (basesrc, event);
 }
