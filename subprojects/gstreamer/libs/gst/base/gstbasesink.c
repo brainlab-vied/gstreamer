@@ -278,6 +278,8 @@ struct _GstBaseSinkPrivate
   gsize rc_accumulated;
 
   gboolean drop_out_of_segment;
+
+  gboolean xlnx_ll;
 };
 
 #define DO_RUNNING_AVG(avg,val,size) (((val) + ((size)-1) * (avg)) / (size))
@@ -307,7 +309,8 @@ struct _GstBaseSinkPrivate
 #define DEFAULT_THROTTLE_TIME       0
 #define DEFAULT_MAX_BITRATE         0
 #define DEFAULT_DROP_OUT_OF_SEGMENT TRUE
-#define DEFAULT_PROCESSING_DEADLINE (20 * GST_MSECOND)
+/* XILINX specific set default to instead of 20ms upstream */
+#define DEFAULT_PROCESSING_DEADLINE 0
 
 enum
 {
@@ -725,6 +728,7 @@ gst_base_sink_init (GstBaseSink * basesink, gpointer g_class)
   priv->max_bitrate = DEFAULT_MAX_BITRATE;
 
   priv->drop_out_of_segment = DEFAULT_DROP_OUT_OF_SEGMENT;
+  priv->xlnx_ll = FALSE;
 
   GST_OBJECT_FLAG_SET (basesink, GST_ELEMENT_FLAG_SINK);
 }
@@ -1243,9 +1247,12 @@ gst_base_sink_query_latency (GstBaseSink * sink, gboolean * live,
         max = us_max;
 
         if (l) {
-          if (max == -1 || min + processing_deadline <= max)
+          if (max == -1 || min + processing_deadline <= max) {
+            GST_DEBUG_OBJECT (sink,
+                "Adding processing deadline %" GST_TIME_FORMAT
+                "to min latency ", GST_TIME_ARGS (processing_deadline));
             min += processing_deadline;
-          else {
+          } else {
             GST_ELEMENT_WARNING (sink, CORE, CLOCK,
                 (_("Pipeline construction is invalid, please add queues.")),
                 ("Not enough buffering available for "
@@ -3100,6 +3107,7 @@ gst_base_sink_is_too_late (GstBaseSink * basesink, GstMiniObject * obj,
   gboolean late;
   guint64 max_lateness;
   GstBaseSinkPrivate *priv;
+  gboolean llp2_latency_hack = FALSE;
 
   priv = basesink->priv;
 
@@ -3123,14 +3131,21 @@ gst_base_sink_is_too_late (GstBaseSink * basesink, GstMiniObject * obj,
   if (G_UNLIKELY (!GST_CLOCK_TIME_IS_VALID (rstart)))
     goto no_timestamp;
 
+  if (max_lateness != DEFAULT_MAX_LATENESS && basesink->priv->xlnx_ll)
+    llp2_latency_hack = TRUE;
+
   /* we can add a valid stop time */
-  if (GST_CLOCK_TIME_IS_VALID (rstop))
-    max_lateness += rstop;
-  else {
+  if (GST_CLOCK_TIME_IS_VALID (rstop)) {
+    if (llp2_latency_hack)
+      max_lateness += rstart;
+    else
+      max_lateness += rstop;
+  } else {
     max_lateness += rstart;
     /* no stop time, use avg frame diff */
-    if (priv->avg_in_diff != -1)
+    if (priv->avg_in_diff != -1 && !llp2_latency_hack) {
       max_lateness += priv->avg_in_diff;
+    }
   }
 
   /* if the jitter bigger than duration and lateness we are too late */
@@ -3412,6 +3427,17 @@ gst_base_sink_default_event (GstBaseSink * basesink, GstEvent * event)
 
       gst_event_parse_caps (event, &caps);
       current_caps = gst_pad_get_current_caps (GST_BASE_SINK_PAD (basesink));
+
+      {
+        GstCapsFeatures *features;
+
+        features = gst_caps_get_features (caps, 0);
+        if (features && gst_caps_features_contains (features,
+                GST_CAPS_FEATURE_MEMORY_XLNX_LL)) {
+          GST_DEBUG_OBJECT (basesink, "sink is using XLNX-LL");
+          basesink->priv->xlnx_ll = TRUE;
+        }
+      }
 
       if (current_caps && gst_caps_is_equal (current_caps, caps)) {
         GST_DEBUG_OBJECT (basesink,
