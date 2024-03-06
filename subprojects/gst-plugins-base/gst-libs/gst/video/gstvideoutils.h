@@ -91,8 +91,8 @@ struct _GstVideoCodecState
 
   GstCaps *allocation_caps;
 
-  GstVideoMasteringDisplayInfo *mastering_display_info;
-  GstVideoContentLightLevel *content_light_level;
+  struct _GstVideoMasteringDisplayInfo *mastering_display_info;
+  struct _GstVideoContentLightLevel *content_light_level;
 
   /*< private >*/
   gpointer padding[GST_PADDING_LARGE - 3];
@@ -114,6 +114,7 @@ typedef enum
   GST_VIDEO_CODEC_FRAME_FLAG_SYNC_POINT             = (1<<1),
   GST_VIDEO_CODEC_FRAME_FLAG_FORCE_KEYFRAME         = (1<<2),
   GST_VIDEO_CODEC_FRAME_FLAG_FORCE_KEYFRAME_HEADERS = (1<<3),
+  GST_VIDEO_CODEC_FRAME_FLAG_XLNX_ALREADY_PUSHED    = (1<<22),
   /**
    * GST_VIDEO_CODEC_FRAME_FLAG_CORRUPTED:
    *
@@ -296,6 +297,7 @@ struct _GstVideoCodecFrame
       GstClockTime ts2;
       guint num_subframes;
       guint subframes_processed;
+      GstBuffer *meta_buffer;
     } ABI;
     gpointer padding[GST_PADDING_LARGE];
   } abidata;

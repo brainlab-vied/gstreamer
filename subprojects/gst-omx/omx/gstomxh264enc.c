@@ -26,6 +26,7 @@
 
 #include "gstomxh264enc.h"
 #include "gstomxh264utils.h"
+#include "gstomxvideo.h"
 
 #ifdef USE_OMX_TARGET_RPI
 #include <OMX_Broadcom.h>
@@ -41,7 +42,8 @@ static gboolean gst_omx_h264_enc_set_format (GstOMXVideoEnc * enc,
 static GstCaps *gst_omx_h264_enc_get_caps (GstOMXVideoEnc * enc,
     GstOMXPort * port, GstVideoCodecState * state);
 static GstFlowReturn gst_omx_h264_enc_handle_output_frame (GstOMXVideoEnc *
-    self, GstOMXPort * port, GstOMXBuffer * buf, GstVideoCodecFrame * frame);
+    self, GstOMXPort * port, GstBuffer * outbuf, GstOMXBuffer * buf,
+    GstVideoCodecFrame * frame);
 static gboolean gst_omx_h264_enc_flush (GstVideoEncoder * enc);
 static gboolean gst_omx_h264_enc_stop (GstVideoEncoder * enc);
 static void gst_omx_h264_enc_set_property (GObject * object, guint prop_id,
@@ -62,7 +64,10 @@ enum
   PROP_ENTROPY_MODE,
   PROP_CONSTRAINED_INTRA_PREDICTION,
   PROP_LOOP_FILTER_MODE,
-  PROP_REF_FRAMES
+  PROP_REF_FRAMES,
+  PROP_GOP_LENGTH,
+  PROP_LOOP_FILTER_BETA_OFFSET,
+  PROP_LOOP_FILTER_ALPHA_C0_OFFSET,
 };
 
 #ifdef USE_OMX_TARGET_RPI
@@ -77,9 +82,12 @@ enum
 #define GST_OMX_H264_VIDEO_ENC_B_FRAMES_DEFAULT (0xffffffff)
 #define ALIGNMENT "au"
 #endif
+#define GST_OMX_H264_VIDEO_ENC_GOP_LENGTH_DEFAULT (30)
 #define GST_OMX_H264_VIDEO_ENC_ENTROPY_MODE_DEFAULT (0xffffffff)
 #define GST_OMX_H264_VIDEO_ENC_CONSTRAINED_INTRA_PREDICTION_DEFAULT (FALSE)
 #define GST_OMX_H264_VIDEO_ENC_LOOP_FILTER_MODE_DEFAULT (0xffffffff)
+#define GST_OMX_H264_VIDEO_ENC_LOOP_FILTER_BETA_OFFSET_DEFAULT (-1)
+#define GST_OMX_H264_VIDEO_ENC_LOOP_FILTER_ALPHA_C0_OFFSET_DEFAULT (-1)
 #define GST_OMX_H264_VIDEO_ENC_REF_FRAMES_DEFAULT 0
 #define GST_OMX_H264_VIDEO_ENC_REF_FRAMES_MIN 0
 #define GST_OMX_H264_VIDEO_ENC_REF_FRAMES_MAX 16
@@ -188,10 +196,26 @@ gst_omx_h264_enc_class_init (GstOMXH264EncClass * klass)
 
   g_object_class_install_property (gobject_class, PROP_B_FRAMES,
       g_param_spec_uint ("b-frames", "Number of B-frames",
+#ifndef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
           "Number of B-frames between two consecutive I-frames (0xffffffff=component default)",
+#else
+          "Number of B-frames between two consecutive P-frames",
+#endif
           0, G_MAXUINT, GST_OMX_H264_VIDEO_ENC_B_FRAMES_DEFAULT,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+#ifndef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
           GST_PARAM_MUTABLE_READY));
+#else
+          GST_PARAM_MUTABLE_PLAYING));
+
+  g_object_class_install_property (gobject_class, PROP_GOP_LENGTH,
+      g_param_spec_uint ("gop-length",
+          "Number of all frames in 1 GOP, Must be in multiple of (b-frames+1)",
+          "Distance between two consecutive I frames", 0,
+          1000, GST_OMX_H264_VIDEO_ENC_GOP_LENGTH_DEFAULT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+          GST_PARAM_MUTABLE_PLAYING));
+#endif
 
   g_object_class_install_property (gobject_class, PROP_ENTROPY_MODE,
       g_param_spec_enum ("entropy-mode", "Entropy Mode",
@@ -219,6 +243,24 @@ gst_omx_h264_enc_class_init (GstOMXH264EncClass * klass)
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
           GST_PARAM_MUTABLE_READY));
 
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+  g_object_class_install_property (gobject_class, PROP_LOOP_FILTER_BETA_OFFSET,
+      g_param_spec_int ("loop-filter-beta-offset", "Loop Filter Beta Offset",
+          "Beta offset for the deblocking filter, used only when loop-filter-mode is enabled",
+          -6, 6, GST_OMX_H264_VIDEO_ENC_LOOP_FILTER_BETA_OFFSET_DEFAULT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+          GST_PARAM_MUTABLE_PLAYING));
+
+  g_object_class_install_property (gobject_class,
+      PROP_LOOP_FILTER_ALPHA_C0_OFFSET,
+      g_param_spec_int ("loop-filter-alpha-c0-offset",
+          "Loop Filter Alpha C0 offset",
+          "Alpha C0 offset for the deblocking filter, used only when loop-filter-mode is enabled",
+          -6, 6, GST_OMX_H264_VIDEO_ENC_LOOP_FILTER_ALPHA_C0_OFFSET_DEFAULT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+          GST_PARAM_MUTABLE_PLAYING));
+#endif
+
   g_object_class_install_property (gobject_class, PROP_REF_FRAMES,
       g_param_spec_uchar ("ref-frames", "Reference frames",
           "Number of reference frames used for inter-motion search (0=component default)",
@@ -230,6 +272,13 @@ gst_omx_h264_enc_class_init (GstOMXH264EncClass * klass)
 
   basevideoenc_class->flush = gst_omx_h264_enc_flush;
   basevideoenc_class->stop = gst_omx_h264_enc_stop;
+
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+  videoenc_class->cdata.default_sink_template_caps =
+      GST_VIDEO_CAPS_MAKE_WITH_FEATURES (GST_CAPS_FEATURE_MEMORY_XLNX_LL,
+      GST_OMX_VIDEO_ENC_SUPPORTED_FORMATS) " ; "
+      GST_VIDEO_CAPS_MAKE (GST_OMX_VIDEO_ENC_SUPPORTED_FORMATS);
+#endif
 
   videoenc_class->cdata.default_src_template_caps = "video/x-h264, "
       "width = (int) [ 16, 4096 ], height = (int) [ 16, 4096 ], "
@@ -246,6 +295,98 @@ gst_omx_h264_enc_class_init (GstOMXH264EncClass * klass)
 
   gst_omx_set_default_role (&videoenc_class->cdata, "video_encoder.avc");
 }
+
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+/* We will set OMX il's nPframes & nBframes parameter as below calculation
+   based on user's input of GopLength & NumBframes
+   nPframes(Number of P frames between each I frame) = (GopLength -1) / (NumBframes+1)
+   nBframes(Number of B frames between each I frame) = GopLength - nPframes - 1
+*/
+static void
+compute_gop_pattern (GstOMXH264Enc * self, guint * n_p_frames,
+    guint * n_b_frames)
+{
+  /* gop_length = 0 and 1 both represents Intra only encoding */
+  if (!self->gop_length)
+    self->gop_length = 1;
+  if (self->gop_length == 1) {
+    GST_LOG_OBJECT (self,
+        "GopLength is 1 so its only Intra. Setting b_frames as 0\n");
+    self->b_frames = 0;
+  }
+
+  *n_p_frames = (self->gop_length - 1) / (self->b_frames + 1);
+  *n_b_frames = self->gop_length - *n_p_frames - 1;
+}
+
+static void
+update_config_video_gop (GstOMXH264Enc * self)
+{
+  OMX_ALG_VIDEO_CONFIG_GROUP_OF_PICTURES config;
+  OMX_ERRORTYPE err;
+
+  GST_OMX_INIT_STRUCT (&config);
+  config.nPortIndex = GST_OMX_VIDEO_ENC (self)->enc_out_port->index;
+
+  err =
+      gst_omx_component_get_config (GST_OMX_VIDEO_ENC (self)->enc,
+      (OMX_INDEXTYPE) OMX_ALG_IndexConfigVideoGroupOfPictures, &config);
+
+  if (err != OMX_ErrorNone)
+    GST_ERROR_OBJECT (self,
+        "Failed to get b-frames parameter: %s (0x%08x)",
+        gst_omx_error_to_string (err), err);
+
+  compute_gop_pattern (self, &config.nPFrames, &config.nBFrames);
+  err =
+      gst_omx_component_set_config (GST_OMX_VIDEO_ENC (self)->enc,
+      (OMX_INDEXTYPE) OMX_ALG_IndexConfigVideoGroupOfPictures, &config);
+
+  if (err != OMX_ErrorNone)
+    GST_ERROR_OBJECT (self,
+        "Failed to set  parameter: %s (0x%08x)",
+        gst_omx_error_to_string (err), err);
+
+}
+
+static void
+update_config_loop_filter_beta_offset (GstOMXH264Enc * self)
+{
+  OMX_ALG_VIDEO_CONFIG_LOOP_FILTER_BETA config;
+  OMX_ERRORTYPE err;
+
+  GST_OMX_INIT_STRUCT (&config);
+  config.nPortIndex = GST_OMX_VIDEO_ENC (self)->enc_out_port->index;
+  config.nLoopFilterBeta = self->loop_filter_beta_offset;
+
+  err =
+      gst_omx_component_set_config (GST_OMX_VIDEO_ENC (self)->enc,
+      (OMX_INDEXTYPE) OMX_ALG_IndexConfigVideoLoopFilterBeta, &config);
+  if (err != OMX_ErrorNone)
+    GST_ERROR_OBJECT (self,
+        "Failed to set  parameter: %s (0x%08x)",
+        gst_omx_error_to_string (err), err);
+}
+
+static void
+update_config_loop_filter_alpha_c0_offset (GstOMXH264Enc * self)
+{
+  OMX_ALG_VIDEO_CONFIG_LOOP_FILTER_TC config;
+  OMX_ERRORTYPE err;
+
+  GST_OMX_INIT_STRUCT (&config);
+  config.nPortIndex = GST_OMX_VIDEO_ENC (self)->enc_out_port->index;
+  config.nLoopFilterTc = self->loop_filter_alpha_c0_offset;
+
+  err =
+      gst_omx_component_set_config (GST_OMX_VIDEO_ENC (self)->enc,
+      (OMX_INDEXTYPE) OMX_ALG_IndexConfigVideoLoopFilterTc, &config);
+  if (err != OMX_ErrorNone)
+    GST_ERROR_OBJECT (self,
+        "Failed to set  parameter: %s (0x%08x)",
+        gst_omx_error_to_string (err), err);
+}
+#endif
 
 static void
 gst_omx_h264_enc_set_property (GObject * object, guint prop_id,
@@ -268,7 +409,18 @@ gst_omx_h264_enc_set_property (GObject * object, guint prop_id,
       break;
     case PROP_B_FRAMES:
       self->b_frames = g_value_get_uint (value);
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+      if (GST_OMX_VIDEO_ENC (self)->enc)
+        update_config_video_gop (self);
+#endif
       break;
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+    case PROP_GOP_LENGTH:
+      self->gop_length = g_value_get_uint (value);
+      if (GST_OMX_VIDEO_ENC (self)->enc)
+        update_config_video_gop (self);
+      break;
+#endif
     case PROP_ENTROPY_MODE:
       self->entropy_mode = g_value_get_enum (value);
       break;
@@ -278,6 +430,26 @@ gst_omx_h264_enc_set_property (GObject * object, guint prop_id,
     case PROP_LOOP_FILTER_MODE:
       self->loop_filter_mode = g_value_get_enum (value);
       break;
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+    case PROP_LOOP_FILTER_BETA_OFFSET:
+      self->loop_filter_beta_offset = g_value_get_int (value);
+      if (self->loop_filter_mode != OMX_VIDEO_AVCLoopFilterEnable)
+        GST_WARNING_OBJECT (self,
+            "Loop Filter Mode not set to enabled. Setting beta offset may do nothing.");
+
+      if (GST_OMX_VIDEO_ENC (self)->enc)
+        update_config_loop_filter_beta_offset (self);
+      break;
+    case PROP_LOOP_FILTER_ALPHA_C0_OFFSET:
+      self->loop_filter_alpha_c0_offset = g_value_get_int (value);
+      if (self->loop_filter_mode != OMX_VIDEO_AVCLoopFilterEnable)
+        GST_WARNING_OBJECT (self,
+            "Loop Filter Mode not set to enabled. Setting alpha c0 offset may do nothing.");
+
+      if (GST_OMX_VIDEO_ENC (self)->enc)
+        update_config_loop_filter_alpha_c0_offset (self);
+      break;
+#endif
     case PROP_REF_FRAMES:
       self->ref_frames = g_value_get_uchar (value);
       break;
@@ -309,6 +481,11 @@ gst_omx_h264_enc_get_property (GObject * object, guint prop_id, GValue * value,
     case PROP_B_FRAMES:
       g_value_set_uint (value, self->b_frames);
       break;
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+    case PROP_GOP_LENGTH:
+      g_value_set_uint (value, self->gop_length);
+      break;
+#endif
     case PROP_ENTROPY_MODE:
       g_value_set_enum (value, self->entropy_mode);
       break;
@@ -318,6 +495,14 @@ gst_omx_h264_enc_get_property (GObject * object, guint prop_id, GValue * value,
     case PROP_LOOP_FILTER_MODE:
       g_value_set_enum (value, self->loop_filter_mode);
       break;
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+    case PROP_LOOP_FILTER_BETA_OFFSET:
+      g_value_set_int (value, self->loop_filter_beta_offset);
+      break;
+    case PROP_LOOP_FILTER_ALPHA_C0_OFFSET:
+      g_value_set_int (value, self->loop_filter_alpha_c0_offset);
+      break;
+#endif
     case PROP_REF_FRAMES:
       g_value_set_uchar (value, self->ref_frames);
       break;
@@ -339,6 +524,13 @@ gst_omx_h264_enc_init (GstOMXH264Enc * self)
   self->interval_intraframes =
       GST_OMX_H264_VIDEO_ENC_INTERVAL_OF_CODING_INTRA_FRAMES_DEFAULT;
   self->b_frames = GST_OMX_H264_VIDEO_ENC_B_FRAMES_DEFAULT;
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+  self->gop_length = GST_OMX_H264_VIDEO_ENC_GOP_LENGTH_DEFAULT;
+  self->loop_filter_beta_offset =
+      GST_OMX_H264_VIDEO_ENC_LOOP_FILTER_BETA_OFFSET_DEFAULT;
+  self->loop_filter_alpha_c0_offset =
+      GST_OMX_H264_VIDEO_ENC_LOOP_FILTER_ALPHA_C0_OFFSET_DEFAULT;
+#endif
   self->entropy_mode = GST_OMX_H264_VIDEO_ENC_ENTROPY_MODE_DEFAULT;
   self->constrained_intra_prediction =
       GST_OMX_H264_VIDEO_ENC_CONSTRAINED_INTRA_PREDICTION_DEFAULT;
@@ -422,6 +614,10 @@ update_param_avc (GstOMXH264Enc * self,
 {
   OMX_VIDEO_PARAM_AVCTYPE param;
   OMX_ERRORTYPE err;
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+  guint32 p_frames;
+  guint32 b_frames;
+#endif
 
   GST_OMX_INIT_STRUCT (&param);
   param.nPortIndex = GST_OMX_VIDEO_ENC (self)->enc_out_port->index;
@@ -445,6 +641,7 @@ update_param_avc (GstOMXH264Enc * self,
   if (level != OMX_VIDEO_AVCLevelMax)
     param.eLevel = level;
 
+#ifndef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
   /* GOP pattern */
   if (self->interval_intraframes !=
       GST_OMX_H264_VIDEO_ENC_INTERVAL_OF_CODING_INTRA_FRAMES_DEFAULT) {
@@ -475,6 +672,26 @@ update_param_avc (GstOMXH264Enc * self,
     }
     param.nBFrames = self->b_frames;
   }
+#else
+
+  if (profile == OMX_VIDEO_AVCProfileBaseline && self->b_frames > 0) {
+    GST_ERROR_OBJECT (self,
+        "Baseline profile doesn't support B-frames (%u requested)",
+        self->b_frames);
+    return FALSE;
+  }
+
+  compute_gop_pattern (self, &p_frames, &b_frames);
+
+  if (p_frames != param.nPFrames) {
+    GST_LOG_OBJECT (self, "Changing number of P-Frame to %d", p_frames);
+    param.nPFrames = p_frames;
+  }
+  if (b_frames != param.nBFrames) {
+    GST_LOG_OBJECT (self, "Changing number of B-Frame to %d", b_frames);
+    param.nBFrames = b_frames;
+  }
+#endif
 
   if (self->ref_frames != GST_OMX_H264_VIDEO_ENC_REF_FRAMES_DEFAULT)
     param.nRefFrames = self->ref_frames;
@@ -507,6 +724,7 @@ update_param_avc (GstOMXH264Enc * self,
   return TRUE;
 }
 
+#ifndef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
 static gboolean
 set_avc_intra_period (GstOMXH264Enc * self)
 {
@@ -561,6 +779,60 @@ set_avc_intra_period (GstOMXH264Enc * self)
 
   return TRUE;
 }
+#else
+static gboolean
+set_alg_decoding_refresh (GstOMXH264Enc * self)
+{
+  OMX_ERRORTYPE err;
+
+  if (GST_OMX_VIDEO_ENC (self)->gdr_mode == OMX_ALG_GDR_HORIZONTAL ||
+      GST_OMX_VIDEO_ENC (self)->gdr_mode == OMX_ALG_GDR_VERTICAL) {
+    OMX_ALG_VIDEO_PARAM_RECOVERY_POINT config_rp;
+    GST_OMX_INIT_STRUCT (&config_rp);
+    config_rp.nPortIndex = GST_OMX_VIDEO_ENC (self)->enc_out_port->index;
+
+    GST_DEBUG_OBJECT (self, "nIDRPeriod:%u",
+        (guint) config_rp.nRecoveryPointFrequency);
+
+    config_rp.nRecoveryPointFrequency = self->periodicty_idr;
+
+    err =
+        gst_omx_component_set_parameter (GST_OMX_VIDEO_ENC (self)->enc,
+        (OMX_INDEXTYPE) OMX_ALG_IndexParamVideoRecoveryPoint,
+        &config_rp);
+    if (err != OMX_ErrorNone) {
+      GST_ERROR_OBJECT (self,
+          "can't set OMX_ALG_IndexParamVideoRecoveryPoint %s (0x%08x)",
+          gst_omx_error_to_string (err), err);
+      return FALSE;
+    }
+  }
+  else {
+    OMX_ALG_VIDEO_PARAM_INSTANTANEOUS_DECODING_REFRESH config_idr;
+    GST_OMX_INIT_STRUCT (&config_idr);
+    config_idr.nPortIndex = GST_OMX_VIDEO_ENC (self)->enc_out_port->index;
+
+    GST_DEBUG_OBJECT (self, "nIDRPeriod:%u",
+        (guint) config_idr.nInstantaneousDecodingRefreshFrequency);
+
+    config_idr.nInstantaneousDecodingRefreshFrequency = self->periodicty_idr;
+
+    err =
+        gst_omx_component_set_parameter (GST_OMX_VIDEO_ENC (self)->enc,
+        (OMX_INDEXTYPE) OMX_ALG_IndexParamVideoInstantaneousDecodingRefresh,
+        &config_idr);
+    if (err != OMX_ErrorNone) {
+      GST_ERROR_OBJECT (self,
+          "can't set OMX_ALG_IndexParamVideoInstantaneousDecodingRefresh %s (0x%08x)",
+          gst_omx_error_to_string (err), err);
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
+#endif
+
+
 
 #ifdef USE_OMX_TARGET_RPI
 static gboolean
@@ -605,6 +877,61 @@ set_brcm_video_intra_period (GstOMXH264Enc * self)
       (guint) intra_period.nU32);
 
   return TRUE;
+}
+#endif
+
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+static gboolean
+set_alg_loop_filter_beta (GstOMXH264Enc * self)
+{
+  OMX_ALG_VIDEO_PARAM_LOOP_FILTER_BETA config;
+  OMX_ERRORTYPE err;
+
+  GST_OMX_INIT_STRUCT (&config);
+  config.nPortIndex = GST_OMX_VIDEO_ENC (self)->enc_out_port->index;
+  config.nLoopFilterBeta = self->loop_filter_beta_offset;
+
+  err =
+      gst_omx_component_set_parameter (GST_OMX_VIDEO_ENC (self)->enc,
+      (OMX_INDEXTYPE) OMX_ALG_IndexParamVideoLoopFilterBeta, &config);
+  if (err != OMX_ErrorNone) {
+    GST_ERROR_OBJECT (self,
+        "can't set OMX_ALG_IndexParamVideoLoopFilterBeta %s (0x%08x)",
+        gst_omx_error_to_string (err), err);
+    return FALSE;
+  }
+
+  GST_DEBUG_OBJECT (self, "OMX_ALG_IndexParamVideoLoopFilterBeta set to %d",
+      config.nLoopFilterBeta);
+
+  return TRUE;
+}
+
+static gboolean
+set_alg_loop_filter_alpha_c0 (GstOMXH264Enc * self)
+{
+  OMX_ALG_VIDEO_CONFIG_LOOP_FILTER_TC config;
+  OMX_ERRORTYPE err;
+
+  GST_OMX_INIT_STRUCT (&config);
+  config.nPortIndex = GST_OMX_VIDEO_ENC (self)->enc_out_port->index;
+  config.nLoopFilterTc = self->loop_filter_alpha_c0_offset;
+
+  err =
+      gst_omx_component_set_parameter (GST_OMX_VIDEO_ENC (self)->enc,
+      (OMX_INDEXTYPE) OMX_ALG_IndexParamVideoLoopFilterTc, &config);
+  if (err != OMX_ErrorNone) {
+    GST_ERROR_OBJECT (self,
+        "can't set OMX_ALG_IndexParamVideoLoopFilterTc %s (0x%08x)",
+        gst_omx_error_to_string (err), err);
+    return FALSE;
+  }
+
+  GST_DEBUG_OBJECT (self, "OMX_ALG_IndexParamVideoLoopFilterTc set to %d",
+      config.nLoopFilterTc);
+
+  return TRUE;
+
 }
 #endif
 
@@ -655,6 +982,7 @@ gst_omx_h264_enc_set_format (GstOMXVideoEnc * enc, GstOMXPort * port,
   }
 #endif
 
+#ifndef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
   /* Configure GOP pattern */
   if (self->periodicty_idr !=
       GST_OMX_H264_VIDEO_ENC_PERIODICITY_OF_IDR_FRAMES_DEFAULT
@@ -662,11 +990,25 @@ gst_omx_h264_enc_set_format (GstOMXVideoEnc * enc, GstOMXPort * port,
       GST_OMX_H264_VIDEO_ENC_INTERVAL_OF_CODING_INTRA_FRAMES_DEFAULT) {
     set_avc_intra_period (self);
   }
+#else
+  if (self->periodicty_idr !=
+      GST_OMX_H264_VIDEO_ENC_PERIODICITY_OF_IDR_FRAMES_DEFAULT) {
+    set_alg_decoding_refresh (self);
+  }
+#endif
+
 #ifdef USE_OMX_TARGET_RPI
   /* The Pi uses a specific OMX setting to configure the intra period */
 
   if (self->interval_intraframes)
     set_brcm_video_intra_period (self);
+#endif
+
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+  if (self->loop_filter_mode == OMX_VIDEO_AVCLoopFilterEnable) {
+    set_alg_loop_filter_beta (self);
+    set_alg_loop_filter_alpha_c0 (self);
+  }
 #endif
 
   gst_omx_port_get_port_definition (GST_OMX_VIDEO_ENC (self)->enc_out_port,
@@ -852,7 +1194,7 @@ gst_omx_h264_enc_get_caps (GstOMXVideoEnc * enc, GstOMXPort * port,
 
 static GstFlowReturn
 gst_omx_h264_enc_handle_output_frame (GstOMXVideoEnc * enc, GstOMXPort * port,
-    GstOMXBuffer * buf, GstVideoCodecFrame * frame)
+    GstBuffer * outbuf, GstOMXBuffer * buf, GstVideoCodecFrame * frame)
 {
   GstOMXH264Enc *self = GST_OMX_H264_ENC (enc);
 
@@ -862,19 +1204,20 @@ gst_omx_h264_enc_handle_output_frame (GstOMXVideoEnc * enc, GstOMXPort * port,
      * in the caps!
      */
     GstBuffer *hdrs;
-    GstMapInfo map = GST_MAP_INFO_INIT;
     GstFlowReturn flow_ret;
 
     GST_DEBUG_OBJECT (self, "got codecconfig in byte-stream format");
 
-    hdrs = gst_buffer_new_and_alloc (buf->omx_buf->nFilledLen);
+    if (outbuf->pool) {
+      /* if the buffer is from the pool, copy it to avoid holding an OMX
+       * buffer forever in the codec data; there is a danger of starvation */
+      hdrs = gst_buffer_copy_deep (outbuf);
+      gst_buffer_unref (outbuf);
+    } else {
+      hdrs = outbuf;
+    }
     GST_BUFFER_FLAG_SET (hdrs, GST_BUFFER_FLAG_HEADER);
 
-    gst_buffer_map (hdrs, &map, GST_MAP_WRITE);
-    memcpy (map.data,
-        buf->omx_buf->pBuffer + buf->omx_buf->nOffset,
-        buf->omx_buf->nFilledLen);
-    gst_buffer_unmap (hdrs, &map);
     self->headers = g_list_append (self->headers, gst_buffer_ref (hdrs));
     frame->output_buffer = hdrs;
     flow_ret =
@@ -889,6 +1232,6 @@ gst_omx_h264_enc_handle_output_frame (GstOMXVideoEnc * enc, GstOMXPort * port,
 
   return
       GST_OMX_VIDEO_ENC_CLASS
-      (gst_omx_h264_enc_parent_class)->handle_output_frame (enc, port, buf,
-      frame);
+      (gst_omx_h264_enc_parent_class)->handle_output_frame (enc, port, outbuf,
+      buf, frame);
 }

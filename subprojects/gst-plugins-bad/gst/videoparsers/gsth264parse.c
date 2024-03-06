@@ -226,6 +226,7 @@ gst_h264_parse_reset_frame (GstH264Parse * h264parse)
 
   /* done parsing; reset state */
   h264parse->current_off = -1;
+  h264parse->prefix_off = -1;
 
   h264parse->update_caps = FALSE;
   h264parse->idr_pos = -1;
@@ -293,6 +294,8 @@ gst_h264_parse_reset_stream_info (GstH264Parse * h264parse)
 
   gst_video_content_light_level_init (&h264parse->content_light_level);
   h264parse->content_light_level_state = GST_H264_PARSE_SEI_EXPIRED;
+
+  h264parse->alt_transfer_char_state = GST_H264_PARSE_SEI_EXPIRED;
 }
 
 static void
@@ -931,6 +934,27 @@ gst_h264_parse_process_sei (GstH264Parse * h264parse, GstH264NalUnit * nalu)
 
         break;
       }
+      case GST_H264_SEI_ALTERNATIVE_TRANSFER_CHARACTERISTICS:
+      {
+        guint8 ptc;
+
+        ptc = sei.payload.alt_transfer_char.preferred_transfer_characteristics;
+
+        GST_LOG_OBJECT (h264parse,
+            "alternative transfer characteristics found: "
+            "preferred transfer characteristic:(%u)", ptc);
+
+        if (h264parse->alt_transfer_char_state == GST_H264_PARSE_SEI_EXPIRED) {
+          h264parse->update_caps = TRUE;
+        } else if (ptc != h264parse->preferred_transfer_char) {
+          h264parse->update_caps = TRUE;
+        }
+
+        h264parse->alt_transfer_char_state = GST_H264_PARSE_SEI_PARSED;
+        h264parse->preferred_transfer_char = ptc;
+
+        break;
+      }
       default:{
         gint payload_type = sei.payloadType;
 
@@ -1145,6 +1169,12 @@ gst_h264_parse_process_nal (GstH264Parse * h264parse, GstH264NalUnit * nalu)
         else if (h264parse->content_light_level_state ==
             GST_H264_PARSE_SEI_ACTIVE)
           h264parse->content_light_level_state = GST_H264_PARSE_SEI_EXPIRED;
+
+        if (h264parse->alt_transfer_char_state == GST_H264_PARSE_SEI_PARSED)
+          h264parse->alt_transfer_char_state = GST_H264_PARSE_SEI_ACTIVE;
+        else if (h264parse->alt_transfer_char_state ==
+            GST_H264_PARSE_SEI_ACTIVE)
+          h264parse->alt_transfer_char_state = GST_H264_PARSE_SEI_EXPIRED;
       }
       break;
     case GST_H264_NAL_AU_DELIMITER:
@@ -1174,7 +1204,17 @@ gst_h264_parse_process_nal (GstH264Parse * h264parse, GstH264NalUnit * nalu)
     GST_LOG_OBJECT (h264parse, "collecting NAL in AVC frame");
     buf = gst_h264_parse_wrap_nal (h264parse, h264parse->format,
         nalu->data + nalu->offset, nalu->size);
-    gst_adapter_push (h264parse->frame_out, buf);
+
+    /* Don't push prefix NAL into adapter until its corresponding NAL is inserted */
+    if (nalu->type != GST_H264_NAL_PREFIX_UNIT) {
+      if (h264parse->prefix_nal) {
+        gst_adapter_push (h264parse->frame_out, h264parse->prefix_nal);
+        h264parse->prefix_nal = NULL;
+      }
+      gst_adapter_push (h264parse->frame_out, buf);
+    } else {
+      h264parse->prefix_nal = buf;
+    }
   }
   return TRUE;
 }
@@ -1200,7 +1240,7 @@ gst_h264_parse_collect_nal (GstH264Parse * h264parse, GstH264NalUnit * nalu)
    * (where spec-wise would fail) */
   complete = h264parse->picture_start && ((nal_type >= GST_H264_NAL_SEI &&
           nal_type <= GST_H264_NAL_AU_DELIMITER) ||
-      (nal_type >= 14 && nal_type <= 18));
+      (nal_type >= 15 && nal_type <= 18));
 
   /* first_mb_in_slice == 0 considered start of frame */
   if (nalu->size > nalu->header_bytes)
@@ -1507,14 +1547,53 @@ gst_h264_parse_handle_frame (GstBaseParse * parse,
 
     GST_DEBUG_OBJECT (h264parse, "%p complete nal found. Off: %u, Size: %u",
         data, nalu.offset, nalu.size);
+#if 0
+    if (!nonext) {
+      /* expect at least 3 bytes start_code, and 1 bytes NALU header.
+       * the length of the NALU payload can be zero.
+       * (e.g. EOS/EOB placed at the end of an AU.) */
+      if (nalu.offset + nalu.size + 3 + 1 > size) {
+        GST_DEBUG_OBJECT (h264parse, "not enough data for next NALU");
+        if (drain) {
+          GST_DEBUG_OBJECT (h264parse, "but draining anyway");
+          nonext = TRUE;
+        } else {
+          goto more;
+        }
+      }
+    }
 
+    if (nalu.type == GST_H264_NAL_PREFIX_UNIT) {
+      h264parse->prefix_off = nalu.sc_offset;
+    } else if (nalu.type == GST_H264_NAL_AU_DELIMITER) {
+      h264parse->prefix_off = -1;
+    }
+#endif
     if (gst_h264_parse_collect_nal (h264parse, &nalu)) {
       h264parse->aud_needed = TRUE;
-      /* complete current frame, if it exist */
+      /* complete current frame, if it exists.
+       * if there is data remaining (current_off > 0) and no prefix
+       *   (prefix_off == -1) -> flush this data up to nalu.sc_offset
+       * if there is data remaining and a prefix not starting from the
+       *   beginning of the buffer (prefix_off > 0 or prefix_off > 1) -> flush
+       *   up to the beginning of the prefix
+       *   prefix_off may be 0 or 1 depending on whether or not prefix is the
+       *   first NAL unit of the AU as per H.264 Annex B.1.2
+       * if all remaining data is part of the prefix -> do nothing
+       */
+#if 0
+      if (current_off > 0 && (h264parse->prefix_off != 0
+              && h264parse->prefix_off != 1)) {
+      nalu.size = 0;
+      nalu.offset =
+	      h264parse->prefix_off > 1 ? h264parse->prefix_off : nalu.sc_offset;
+      h264parse->marker = TRUE;
+#else
       if (current_off > 0) {
         nalu.size = 0;
         nalu.offset = nalu.sc_offset;
         h264parse->marker = TRUE;
+#endif
         break;
       }
     }
@@ -1542,23 +1621,33 @@ gst_h264_parse_handle_frame (GstBaseParse * parse,
 
     /* if no next nal, we reached the end of this buffer */
     if (nonext) {
-      /* If there is a marker flag, or input is AU, we know this is complete */
-      if (GST_BUFFER_FLAG_IS_SET (frame->buffer, GST_BUFFER_FLAG_MARKER) ||
-          h264parse->in_align == GST_H264_PARSE_ALIGN_AU) {
-        h264parse->marker = TRUE;
-        break;
-      }
+      /* We may have complete frame ff we have valid header */
+      if (GST_H264_PARSE_STATE_VALID (h264parse,
+              GST_H264_PARSE_STATE_VALID_PICTURE_HEADERS)) {
+        /* If there is a marker flag, or input is AU */
+        if (GST_BUFFER_FLAG_IS_SET (frame->buffer, GST_BUFFER_FLAG_MARKER) ||
+            h264parse->in_align == GST_H264_PARSE_ALIGN_AU) {
+          h264parse->marker = TRUE;
+          break;
+        }
 
-      /* or if we are draining */
-      if (drain || h264parse->align == GST_H264_PARSE_ALIGN_NAL)
-        break;
+        /* or if we are draining or output alignment is NAL */
+        /* ...but treat the PREFIX_UNIT as an incomplete NAL */
+        if (drain || (h264parse->align == GST_H264_PARSE_ALIGN_NAL &&
+                nalu.type != GST_H264_NAL_PREFIX_UNIT))
+          break;
+      }
 
       current_off = nalu.offset + nalu.size;
       goto more;
     }
 
     /* If the output is NAL, we are done */
-    if (h264parse->align == GST_H264_PARSE_ALIGN_NAL)
+    /* ...but treat the PREFIX_UNIT as an incomplete NAL */
+    if (h264parse->align == GST_H264_PARSE_ALIGN_NAL &&
+        nalu.type != GST_H264_NAL_PREFIX_UNIT &&
+        GST_H264_PARSE_STATE_VALID (h264parse,
+            GST_H264_PARSE_STATE_VALID_PICTURE_HEADERS))
       break;
 
     GST_DEBUG_OBJECT (h264parse, "Looking for more");
@@ -1580,6 +1669,13 @@ end:
   framesize = nalu.offset + nalu.size;
 
   gst_buffer_unmap (buffer, &map);
+  /* If we saw a prefix NAL but no corresponding NAL afterwards or we didn't
+   * insert the corresponding NAL, ignore the prefix until we push the
+   * corresponding NAL in upcoming buffers */
+  if (h264parse->prefix_nal) {
+    gst_buffer_unref (h264parse->prefix_nal);
+    h264parse->prefix_nal = NULL;
+  }
 
   gst_h264_parse_parse_frame (parse, frame);
 
@@ -2402,6 +2498,26 @@ gst_h264_parse_update_src_caps (GstH264Parse * h264parse, GstCaps * caps)
             "bit-depth-chroma", G_TYPE_UINT, bit_depth_chroma, NULL);
 
       if (colorimetry && (!s || !gst_structure_has_field (s, "colorimetry"))) {
+        if (h264parse->alt_transfer_char_state != GST_H264_PARSE_SEI_EXPIRED) {
+          GstVideoColorimetry ci = { 0, };
+          gboolean ret;
+
+          ret = gst_video_colorimetry_from_string (&ci, colorimetry);
+          if (ret
+              && ci.transfer !=
+              gst_video_transfer_function_from_iso
+              (h264parse->preferred_transfer_char)) {
+            ci.transfer =
+                gst_video_transfer_function_from_iso
+                (h264parse->preferred_transfer_char);
+
+            g_free (colorimetry);
+            colorimetry = gst_video_colorimetry_to_string (&ci);
+            GST_DEBUG_OBJECT (h264parse,
+                "Forcing colorimetry to %s due to ATC SEI", colorimetry);
+          }
+        }
+
         gst_caps_set_simple (caps, "colorimetry", G_TYPE_STRING, colorimetry,
             NULL);
       }
@@ -2860,6 +2976,10 @@ gst_h264_parse_push_codec_buffer (GstH264Parse * h264parse,
   wrapped_nal = gst_h264_parse_wrap_nal (h264parse, h264parse->format,
       map.data, map.size);
   gst_buffer_unmap (nal, &map);
+
+  if (GST_BUFFER_FLAG_IS_SET (buffer, GST_BUFFER_FLAG_DELTA_UNIT)) {
+    GST_BUFFER_FLAG_SET (wrapped_nal, GST_BUFFER_FLAG_DELTA_UNIT);
+  }
 
   GST_BUFFER_PTS (wrapped_nal) = GST_BUFFER_PTS (buffer);
   GST_BUFFER_DTS (wrapped_nal) = GST_BUFFER_DTS (buffer);

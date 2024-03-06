@@ -139,7 +139,11 @@ gst_omx_core_acquire (const gchar * filename)
     if (!g_module_symbol (core->module, "OMX_Deinit",
             (gpointer *) & core->deinit))
       goto symbol_error;
+#ifdef USE_OMX_TARGET_VERSAL
+    if (!g_module_symbol (core->module, "OMX_ALG_GetHandle",
+#else
     if (!g_module_symbol (core->module, "OMX_GetHandle",
+#endif
             (gpointer *) & core->get_handle))
       goto symbol_error;
     if (!g_module_symbol (core->module, "OMX_FreeHandle",
@@ -223,6 +227,18 @@ gst_omx_core_release (GstOMXCore * core)
   G_UNLOCK (core_handles);
 }
 
+static void
+gst_omx_message_free (GstOMXMessage * msg)
+{
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
+  if (msg->type == GST_OMX_MESSAGE_SEI_PARSED)
+    if (msg->content.sei_parsed.payload)
+      g_free (msg->content.sei_parsed.payload);
+#endif
+
+  g_slice_free (GstOMXMessage, msg);
+}
+
 /* NOTE: comp->messages_lock will be used */
 static void
 gst_omx_component_flush_messages (GstOMXComponent * comp)
@@ -231,7 +247,7 @@ gst_omx_component_flush_messages (GstOMXComponent * comp)
 
   g_mutex_lock (&comp->messages_lock);
   while ((msg = g_queue_pop_head (&comp->messages))) {
-    g_slice_free (GstOMXMessage, msg);
+    gst_omx_message_free (msg);
   }
   g_mutex_unlock (&comp->messages_lock);
 }
@@ -246,6 +262,59 @@ gst_omx_buffer_reset (GstOMXBuffer * buf)
 }
 
 static void gst_omx_buffer_unmap (GstOMXBuffer * buffer);
+
+typedef struct
+{
+  GstEvent *event;
+  /* The buffer preceding this event so we preserve the ordering between output buffers and events.
+   * If NULL the event can be send right away */
+  GstOMXBuffer *preceding_buffer;
+} GstOMXPendingEvent;
+
+static void
+gst_omx_pending_event_free (GstOMXPendingEvent * pending)
+{
+  if (pending->event)
+    gst_event_unref (pending->event);
+
+  g_free (pending);
+}
+
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
+/* @event: (transfer full) */
+static void
+gst_omx_component_add_downstream_pending_event (GstOMXComponent * comp,
+    GstEvent * event, GstOMXBuffer * preceding_buffer)
+{
+  GstOMXPendingEvent *pending = g_new (GstOMXPendingEvent, 1);
+
+  pending->event = event;       /* transfer ownership */
+  pending->preceding_buffer = preceding_buffer;
+
+  g_queue_push_tail (&comp->pending_downstream_events, pending);
+}
+#endif
+
+/* Returns: (transfer full) */
+GstEvent *
+gst_omx_component_pop_pending_downstream_event (GstOMXComponent * comp,
+    GstOMXBuffer * preceding_buffer)
+{
+  GstOMXPendingEvent *pending;
+  GstEvent *event;
+
+  pending = g_queue_peek_head (&comp->pending_downstream_events);
+  if (!pending || pending->preceding_buffer != preceding_buffer) {
+    return NULL;
+  }
+
+  pending = g_queue_pop_head (&comp->pending_downstream_events);
+  event = pending->event;
+  pending->event = NULL;
+
+  gst_omx_pending_event_free (pending);
+  return event;
+}
 
 /* NOTE: Call with comp->lock, comp->messages_lock will be used */
 static void
@@ -339,6 +408,7 @@ gst_omx_component_handle_messages (GstOMXComponent * comp)
 
           if (index == OMX_ALL || index == port->index) {
             port->settings_cookie++;
+            port->old_port_def = port->port_def;
             gst_omx_port_update_port_definition (port, NULL);
             if (port->port_def.eDir == OMX_DirOutput && !port->tunneled)
               outports = g_list_prepend (outports, port);
@@ -430,13 +500,65 @@ gst_omx_component_handle_messages (GstOMXComponent * comp)
 
         break;
       }
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
+      case GST_OMX_MESSAGE_SEI_PARSED:{
+        if (GST_IS_OMX_VIDEO_DEC (comp->parent)) {
+          GstBuffer *buf;
+          GstEvent *event;
+          GstOMXPort *port;
+
+          /* Assume output port has index 1, which it is with our OMX stack */
+          port = gst_omx_component_get_port (comp, 1);
+          if (!port || !msg->content.sei_parsed.payload
+              || !msg->content.sei_parsed.payload_size)
+            break;
+
+          buf = gst_buffer_new_wrapped (msg->content.sei_parsed.payload,
+              msg->content.sei_parsed.payload_size);
+          msg->content.sei_parsed.payload = NULL;
+
+          event = gst_event_new_custom (GST_EVENT_CUSTOM_DOWNSTREAM,
+              gst_structure_new ("omx-alg/sei-parsed",
+                  "prefix", G_TYPE_BOOLEAN,
+                  msg->content.sei_parsed.prefix,
+                  "payload-type", G_TYPE_UINT,
+                  msg->content.sei_parsed.payload_type,
+                  "payload", GST_TYPE_BUFFER, buf, NULL));
+          gst_buffer_unref (buf);
+
+          gst_omx_component_add_downstream_pending_event (comp, event,
+              g_queue_peek_tail (&port->pending_buffers));
+        } else {
+          GST_WARNING_OBJECT (comp->parent,
+              "Received SEI event on a not video decoder component");
+        }
+
+        break;
+      }
+      case GST_OMX_MESSAGE_ALG_RESOLUTION_CHANGED:{
+        guint i, n;
+
+        n = (comp->ports ? comp->ports->len : 0);
+        for (i = 0; i < n; i++) {
+          GstOMXPort *port = g_ptr_array_index (comp->ports, i);
+
+          /* HACK: output port has always index 1 on zynq */
+          if (port->index == 1) {
+            port->old_port_def = port->port_def;
+            port->resolution_changed = TRUE;
+          }
+        }
+
+        break;
+      }
+#endif
       default:{
         g_assert_not_reached ();
         break;
       }
     }
 
-    g_slice_free (GstOMXMessage, msg);
+    gst_omx_message_free (msg);
 
     g_mutex_lock (&comp->messages_lock);
   }
@@ -536,6 +658,20 @@ omx_event_type_to_str (OMX_EVENTTYPE event)
       break;
   }
 
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
+  switch ((OMX_ALG_EVENTTYPE) event) {
+    case OMX_ALG_EventSEIPrefixParsed:
+      return "ALG_EventSEIPrefixParsed";
+    case OMX_ALG_EventSEISuffixParsed:
+      return "ALG_EventSEISuffixParsed";
+    case OMX_ALG_EventResolutionChanged:
+      return "ALG_EventResolutionChanged";
+    case OMX_ALG_EventVendorStartUnused:
+    case OMX_ALG_EventMax:
+      break;
+  }
+#endif
+
   return NULL;
 }
 
@@ -609,6 +745,21 @@ omx_event_to_debug_struct (OMX_EVENTTYPE event,
       break;
   }
 
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
+  switch ((OMX_ALG_EVENTTYPE) event) {
+    case OMX_ALG_EventSEIPrefixParsed:
+    case OMX_ALG_EventSEISuffixParsed:
+      return gst_structure_new (name, "payload-type", G_TYPE_UINT, data1,
+          "payload-size", G_TYPE_UINT, data2, NULL);
+    case OMX_ALG_EventResolutionChanged:
+      return gst_structure_new (name, "width", G_TYPE_UINT, data1,
+          "height", G_TYPE_UINT, data2, NULL);
+    case OMX_ALG_EventVendorStartUnused:
+    case OMX_ALG_EventMax:
+      break;
+  }
+#endif
+
   return NULL;
 }
 
@@ -636,6 +787,50 @@ log_omx_api_trace_event (GstOMXComponent * comp, OMX_EVENTTYPE event,
   gst_structure_free (s);
 #endif /* GST_DISABLE_GST_DEBUG */
 }
+
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
+static gboolean
+AlgEventHandler (GstOMXComponent * comp, OMX_PTR pAppData, OMX_EVENTTYPE eEvent,
+    OMX_U32 nData1, OMX_U32 nData2, OMX_PTR pEventData)
+{
+  switch ((OMX_ALG_EVENTTYPE) eEvent) {
+    case OMX_ALG_EventSEIPrefixParsed:
+    case OMX_ALG_EventSEISuffixParsed:{
+      GstOMXMessage *msg = g_slice_new (GstOMXMessage);
+      gboolean prefix =
+          ((OMX_ALG_EVENTTYPE) eEvent == OMX_ALG_EventSEIPrefixParsed);
+
+      GST_DEBUG_OBJECT (comp->parent,
+          "SEI %s parsed, payload-type: %d payload-size: %d",
+          prefix ? "prefix" : "suffix", nData1, nData2);
+
+      msg->type = GST_OMX_MESSAGE_SEI_PARSED;
+      msg->content.sei_parsed.prefix = prefix;
+      msg->content.sei_parsed.payload_type = nData1;
+      msg->content.sei_parsed.payload_size = nData2;
+      msg->content.sei_parsed.payload = g_memdup (pEventData, nData2);
+
+      gst_omx_component_send_message (comp, msg);
+      return TRUE;
+    }
+    case OMX_ALG_EventResolutionChanged:{
+      GstOMXMessage *msg = g_slice_new (GstOMXMessage);
+
+      GST_DEBUG_OBJECT (comp->parent, "Output resolution change: %dx%d", nData1,
+          nData2);
+
+      msg->type = GST_OMX_MESSAGE_ALG_RESOLUTION_CHANGED;
+
+      gst_omx_component_send_message (comp, msg);
+      return TRUE;
+    }
+    case OMX_ALG_EventVendorStartUnused:
+    case OMX_ALG_EventMax:
+      break;
+  }
+  return FALSE;
+}
+#endif
 
 static OMX_ERRORTYPE
 EventHandler (OMX_HANDLETYPE hComponent, OMX_PTR pAppData, OMX_EVENTTYPE eEvent,
@@ -771,6 +966,10 @@ EventHandler (OMX_HANDLETYPE hComponent, OMX_PTR pAppData, OMX_EVENTTYPE eEvent,
     }
     case OMX_EventPortFormatDetected:
     default:
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
+      if (AlgEventHandler (comp, pAppData, eEvent, nData1, nData2, pEventData))
+        return OMX_ErrorNone;
+#endif
       GST_DEBUG_OBJECT (comp->parent, "%s unknown event 0x%08x", comp->name,
           eEvent);
       break;
@@ -830,6 +1029,7 @@ log_omx_api_trace_buffer (GstOMXComponent * comp, const gchar * event,
         "TimeStamp", G_TYPE_UINT64, GST_OMX_GET_TICKS (buf->omx_buf->nTimeStamp),
         "AllocLen", G_TYPE_UINT, buf->omx_buf->nAllocLen,
         "FilledLen", G_TYPE_UINT, buf->omx_buf->nFilledLen,
+        "TickCount", G_TYPE_UINT, buf->omx_buf->nTickCount,
         "flags", G_TYPE_UINT, buf->omx_buf->nFlags,
         "flags-str", G_TYPE_STRING, gst_omx_buffer_flags_to_string (buf->omx_buf->nFlags),
         NULL);
@@ -959,9 +1159,26 @@ gst_omx_component_new (GstObject * parent, const gchar * core_name,
   else
     comp->name = g_strdup (component_name);
 
-  err =
-      core->get_handle (&comp->handle, (OMX_STRING) component_name, comp,
+#ifdef USE_OMX_TARGET_VERSAL
+  OMX_ALG_COREINDEXTYPE coreType = OMX_ALG_CoreIndexDevice;
+  OMX_PTR coreSettings;
+  struct OMX_ALG_CORE_DEVICE device;
+
+  memset (&device, 0, sizeof (device));
+  device.nSize = sizeof (device);
+  device.nVersion.s.nVersionMajor = OMX_VERSION_MAJOR;
+  device.nVersion.s.nVersionMinor = OMX_VERSION_MINOR;
+  device.nVersion.s.nRevision = OMX_VERSION_REVISION;
+  device.nVersion.s.nStep = OMX_VERSION_STEP;
+  device.cDevice = strdup (((GstOMXVideoDec *) parent)->device);
+  coreSettings = &device;
+
+  err = core->get_handle (&comp->handle, (OMX_STRING) component_name, comp,
+      &callbacks, coreType, coreSettings);
+#else
+  err = core->get_handle (&comp->handle, (OMX_STRING) component_name, comp,
       &callbacks);
+#endif
   if (err != OMX_ErrorNone) {
     GST_ERROR_OBJECT (parent,
         "Failed to get component handle '%s' from core '%s': 0x%08x",
@@ -988,6 +1205,7 @@ gst_omx_component_new (GstObject * parent, const gchar * core_name,
   g_queue_init (&comp->messages);
   comp->pending_state = OMX_StateInvalid;
   comp->last_error = OMX_ErrorNone;
+  g_queue_init (&comp->pending_downstream_events);
 
   /* Set component role if any */
   if (component_role && !(hacks & GST_OMX_HACK_NO_COMPONENT_ROLE)) {
@@ -1049,6 +1267,9 @@ gst_omx_component_free (GstOMXComponent * comp)
   gst_omx_core_release (comp->core);
 
   gst_omx_component_flush_messages (comp);
+
+  g_queue_foreach (&comp->pending_downstream_events,
+      (GFunc) gst_omx_pending_event_free, NULL);
 
   g_cond_clear (&comp->messages_cond);
   g_mutex_clear (&comp->messages_lock);
@@ -1719,7 +1940,7 @@ omx_index_type_to_str (OMX_INDEXTYPE index)
   }
 #endif
 
-#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
   switch ((OMX_ALG_INDEXTYPE) index) {
     case OMX_ALG_IndexVendorComponentStartUnused:
       return "OMX_ALG_IndexVendorComponentStartUnused";
@@ -1862,7 +2083,7 @@ omx_index_type_to_str (OMX_INDEXTYPE index)
   }
 #endif
 
-#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
   /* Not part of the enum in OMX_IndexAlg.h */
   if (index == OMX_ALG_IndexParamVideoInterlaceFormatSupported)
     return "OMX_ALG_IndexParamVideoInterlaceFormatSupported";
@@ -2219,6 +2440,15 @@ retry:
     ret = GST_OMX_ACQUIRE_BUFFER_RECONFIGURE;
     goto done;
   }
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
+  if (port->resolution_changed) {
+    GST_DEBUG_OBJECT (comp->parent, "Component %s port %d resolution changed",
+        comp->name, port->index);
+    ret = GST_OMX_ACQUIRE_BUFFER_RESOLUTION_CHANGE;
+    port->resolution_changed = FALSE;
+    goto done;
+  }
+#endif
 
   if (port->port_def.eDir == OMX_DirOutput && port->eos) {
     if (!g_queue_is_empty (&port->pending_buffers)) {
@@ -2359,6 +2589,22 @@ done:
   g_mutex_unlock (&comp->lock);
 
   return err;
+}
+
+gint
+gst_omx_port_find_buffer_idx (GstOMXPort * port, GstOMXBuffer * buf)
+{
+  gint i, n;
+
+  n = port->buffers->len;
+  for (i = 0; i < n; i++) {
+    GstOMXBuffer *tmp = g_ptr_array_index (port->buffers, i);
+
+    if (tmp == buf)
+      return i;
+  }
+
+  return -1;
 }
 
 /* NOTE: Must be called while holding comp->lock */
@@ -2676,7 +2922,7 @@ gst_omx_is_dynamic_allocation_supported (void)
 {
   /* The Zynqultrascaleplus stack implements OMX 1.1.0 but supports the dynamic
    * allocation mode from 1.2.0 as an extension. */
-#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
   return TRUE;
 #endif
 
@@ -2968,7 +3214,7 @@ gst_omx_port_set_enabled_unlocked (GstOMXPort * port, gboolean enabled)
 
   /* Check if the port is already enabled/disabled first */
   gst_omx_port_update_port_definition (port, NULL);
-  if (! !port->port_def.bEnabled == ! !enabled)
+  if (!!port->port_def.bEnabled == !!enabled)
     goto done;
 
   if (enabled)
@@ -3246,7 +3492,7 @@ gst_omx_port_wait_enabled_unlocked (GstOMXPort * port, GstClockTime timeout)
   gst_omx_port_update_port_definition (port, NULL);
   gst_omx_component_handle_messages (comp);
   while (signalled && last_error == OMX_ErrorNone &&
-      (! !port->port_def.bEnabled != ! !enabled || port->enabled_pending
+      (!!port->port_def.bEnabled != !!enabled || port->enabled_pending
           || port->disabled_pending)) {
     signalled = gst_omx_component_wait_message (comp, timeout);
     if (signalled)
@@ -3311,7 +3557,7 @@ gst_omx_port_is_enabled (GstOMXPort * port)
   g_return_val_if_fail (port != NULL, FALSE);
 
   gst_omx_port_update_port_definition (port, NULL);
-  enabled = ! !port->port_def.bEnabled;
+  enabled = !!port->port_def.bEnabled;
 
   GST_DEBUG_OBJECT (port->comp->parent, "%s port %u is enabled: %d",
       port->comp->name, port->index, enabled);
@@ -3427,7 +3673,7 @@ gst_omx_port_update_buffer_count_actual (GstOMXPort * port, guint nb)
 gboolean
 gst_omx_port_set_dmabuf (GstOMXPort * port, gboolean dmabuf)
 {
-#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
   OMX_ALG_PORT_PARAM_BUFFER_MODE buffer_mode;
   OMX_ERRORTYPE err;
 
@@ -3459,7 +3705,7 @@ gst_omx_port_set_dmabuf (GstOMXPort * port, gboolean dmabuf)
 gboolean
 gst_omx_port_set_subframe (GstOMXPort * port, gboolean enabled)
 {
-#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
   OMX_ALG_VIDEO_PARAM_SUBFRAME subframe_mode;
   OMX_ERRORTYPE err;
   GST_DEBUG_OBJECT (port->comp->parent, "%s subframe mode for Zynq",
@@ -3489,7 +3735,7 @@ gst_omx_port_set_subframe (GstOMXPort * port, gboolean enabled)
 gboolean
 gst_omx_port_get_subframe (GstOMXPort * port)
 {
-#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
   OMX_ALG_VIDEO_PARAM_SUBFRAME subframe_mode;
   OMX_ERRORTYPE err;
 
@@ -3530,8 +3776,11 @@ static const GGetTypeFunction types[] = {
 #ifdef HAVE_THEORA
       , gst_omx_theora_dec_get_type
 #endif
-#ifdef HAVE_HEVC
+#if defined(HAVE_HEVC) && defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS)
       , gst_omx_h265_enc_get_type, gst_omx_h265_dec_get_type
+#endif
+#if defined(HAVE_HEVC) && defined(USE_OMX_TARGET_VERSAL)
+      , gst_omx_h265_dec_get_type
 #endif
 };
 
@@ -3640,6 +3889,17 @@ gst_omx_error_to_string (OMX_ERRORTYPE err)
     case OMX_ErrorContentPipeCreationFailed:
       return "Content pipe creation failed";
 #endif
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
+    case OMX_ALG_ErrorNoChannelLeft:
+      return
+          "Maximum number of channel supported at the same time has been exceeded";
+    case OMX_ALG_ErrorChannelResourceUnavailable:
+      return
+          "Component doesn't have enough hardware resources available to process the channel";
+    case OMX_ALG_ErrorChannelLoadDistribution:
+      return
+          "Component has enough hardware resources available but they are used by the other channels in a way that make it impossible for the new channel to access these resources";
+#endif
     default:
       if (err_u >= (guint) OMX_ErrorKhronosExtensions
           && err_u < (guint) OMX_ErrorVendorStartUnused) {
@@ -3733,7 +3993,7 @@ struct BufferFlagString buffer_flags_map[] = {
 #ifdef OMX_BUFFERFLAG_SKIPFRAME
   {OMX_BUFFERFLAG_SKIPFRAME, "skip-frame"},
 #endif
-#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
   {OMX_ALG_BUFFERFLAG_TOP_FIELD, "top-field"},
   {OMX_ALG_BUFFERFLAG_BOT_FIELD, "bottom-field"},
 #endif

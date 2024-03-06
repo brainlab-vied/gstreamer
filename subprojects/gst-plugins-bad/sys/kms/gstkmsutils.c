@@ -31,6 +31,26 @@
 
 #include "gstkmsutils.h"
 
+#ifndef DRM_FORMAT_Y8
+#define DRM_FORMAT_Y8		fourcc_code('G', 'R', 'E', 'Y') /* 8  Greyscale	*/
+#endif
+
+#ifndef DRM_FORMAT_Y10
+#define DRM_FORMAT_Y10		fourcc_code('Y', '1', '0', ' ') /* 10 Greyscale */
+#endif
+
+#ifndef DRM_FORMAT_XV15
+#define DRM_FORMAT_XV15		fourcc_code('X', 'V', '1', '5') /* 2x2 subsampled Cr:Cb plane 2:10:10:10 */
+#endif
+
+#ifndef DRM_FORMAT_XV20
+#define DRM_FORMAT_XV20		fourcc_code('X', 'V', '2', '0') /* 2x1 subsampled Cr:Cb plane 2:10:10:10 */
+#endif
+
+#ifndef DRM_FORMAT_X403
+#define DRM_FORMAT_X403		fourcc_code('X', '4', '0', '3') /* non-subsampled Cb:Cr plane 2:10:10:10 */
+#endif
+
 /* *INDENT-OFF* */
 static const struct
 {
@@ -50,11 +70,16 @@ static const struct
   /* 16bits/c YUV 4:2:0 */
   DEF_FMT (P016, P016_LE),
 
+  DEF_FMT (Y8, GRAY8),
+  DEF_FMT (Y10, GRAY10_LE32),
+  DEF_FMT (X403, Y444_10LE32),
+
   /* 16bits/c YUV 4:2:0 */
   DEF_FMT (P010, P010_10LE),
 
   /* YUV 4:4:4 */
   DEF_FMT (NV24, NV24),
+  DEF_FMT (YUV444, Y444),
 
   /* 32bits/p RGB opaque */
   DEF_FMT (XRGB8888, BGRx),
@@ -81,6 +106,12 @@ static const struct
   /* 16bits/p RGB */
   DEF_FMT (RGB565, RGB16),
   DEF_FMT (BGR565, BGR16),
+  DEF_FMT (NV16, NV16),
+#ifdef DRM_FORMAT_XV15
+  /* Both formats have been added together */
+  DEF_FMT (XV15, NV12_10LE32),
+  DEF_FMT (XV20, NV16_10LE32),
+#endif
 
 #undef DEF_FMT
 };
@@ -121,9 +152,11 @@ gst_drm_bpp_from_drm (guint32 drmfmt)
     case DRM_FORMAT_YUV420:
     case DRM_FORMAT_YVU420:
     case DRM_FORMAT_YUV422:
+    case DRM_FORMAT_YUV444:
     case DRM_FORMAT_NV12:
     case DRM_FORMAT_NV21:
     case DRM_FORMAT_NV16:
+    case DRM_FORMAT_Y8:
     case DRM_FORMAT_NV61:
     case DRM_FORMAT_NV24:
       bpp = 8;
@@ -131,6 +164,14 @@ gst_drm_bpp_from_drm (guint32 drmfmt)
     case DRM_FORMAT_P010:
       bpp = 10;
       break;
+#ifdef DRM_FORMAT_XV15
+    case DRM_FORMAT_XV15:
+    case DRM_FORMAT_XV20:
+    case DRM_FORMAT_Y10:
+      /* One 32b macro pixel: three 10b pixels + 2b padding */
+      bpp = 32;
+      break;
+#endif
     case DRM_FORMAT_UYVY:
     case DRM_FORMAT_YUYV:
     case DRM_FORMAT_YVYU:
@@ -143,12 +184,46 @@ gst_drm_bpp_from_drm (guint32 drmfmt)
     case DRM_FORMAT_RGB888:
       bpp = 24;
       break;
+    case DRM_FORMAT_X403:
     default:
       bpp = 32;
       break;
   }
 
   return bpp;
+}
+
+guint32
+gst_drm_width_from_drm (guint32 drmfmt, guint32 width)
+{
+  guint32 ret;
+
+  switch (drmfmt) {
+    case DRM_FORMAT_YUV420:
+    case DRM_FORMAT_YVU420:
+    case DRM_FORMAT_YUV422:
+    case DRM_FORMAT_YUV444:
+      if (is_dp)
+        ret = GST_ROUND_UP_N (width, 512);
+      else
+        ret = width;
+      break;
+#ifdef DRM_FORMAT_XV15
+      /* Convert pixel width to macropixel width */
+    case DRM_FORMAT_Y10:
+    case DRM_FORMAT_XV15:
+    case DRM_FORMAT_XV20:
+    case DRM_FORMAT_X403:
+      ret = gst_util_uint64_scale_round (width, 1, 3);
+      break;
+#endif
+    default:
+      ret = width;
+      break;
+  }
+
+
+  return ret;
 }
 
 guint32
@@ -159,17 +234,25 @@ gst_drm_height_from_drm (guint32 drmfmt, guint32 height)
   switch (drmfmt) {
     case DRM_FORMAT_YUV420:
     case DRM_FORMAT_YVU420:
-    case DRM_FORMAT_YUV422:
     case DRM_FORMAT_NV12:
     case DRM_FORMAT_NV21:
+#ifdef DRM_FORMAT_XV15
+    case DRM_FORMAT_XV15:
+#endif
     case DRM_FORMAT_P010:
     case DRM_FORMAT_P016:
       ret = height * 3 / 2;
       break;
     case DRM_FORMAT_NV16:
     case DRM_FORMAT_NV61:
+    case DRM_FORMAT_YUV422:
+#ifdef DRM_FORMAT_XV20
+    case DRM_FORMAT_XV20:
+#endif
       ret = height * 2;
       break;
+    case DRM_FORMAT_YUV444:
+    case DRM_FORMAT_X403:
     case DRM_FORMAT_NV24:
       ret = height * 3;
       break;
@@ -194,11 +277,47 @@ gst_video_format_to_structure (GstVideoFormat format)
   return structure;
 }
 
+
+#define SYNC_IP_DEV_DECODER "/dev/xlnxsync1"
+
+static gboolean
+xlnx_ll_supported (void)
+{
+  return TRUE;
+}
+
+GstCaps *
+gst_kms_add_xlnx_ll_caps (GstCaps * caps, gboolean if_supported)
+{
+  GstCaps *caps_xlnx_ll;
+  guint i;
+
+  if (if_supported && !xlnx_ll_supported ())
+    return caps;
+
+  caps_xlnx_ll = gst_caps_copy (caps);
+
+  for (i = 0; i < gst_caps_get_size (caps_xlnx_ll); i++) {
+    GstCapsFeatures *feats;
+
+    feats = gst_caps_get_features (caps_xlnx_ll, i);
+    if (feats) {
+      gst_caps_features_remove (feats, GST_CAPS_FEATURE_MEMORY_SYSTEM_MEMORY);
+      gst_caps_features_add (feats, GST_CAPS_FEATURE_MEMORY_XLNX_LL);
+    } else {
+      gst_caps_set_features (caps_xlnx_ll, gst_caps_get_size (caps_xlnx_ll) - 1,
+          gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_XLNX_LL, NULL));
+    }
+  }
+
+  return gst_caps_merge (caps, caps_xlnx_ll);
+}
+
 GstCaps *
 gst_kms_sink_caps_template_fill (void)
 {
   gint i;
-  GstCaps *caps;
+  GstCaps *caps, *caps_alternate;
   GstStructure *template;
 
   caps = gst_caps_new_empty ();
@@ -210,7 +329,22 @@ gst_kms_sink_caps_template_fill (void)
         "framerate", GST_TYPE_FRACTION_RANGE, 0, 1, G_MAXINT, 1, NULL);
     gst_caps_append_structure (caps, template);
   }
-  return gst_caps_simplify (caps);
+  caps = gst_caps_simplify (caps);
+
+  /* Add an 'alternate' variant of the caps with the feature */
+  caps_alternate = gst_caps_copy (caps);
+  gst_caps_set_simple (caps_alternate, "interlace-mode", G_TYPE_STRING,
+      "alternate", NULL);
+
+  for (i = 0; i < gst_caps_get_size (caps_alternate); i++) {
+    gst_caps_set_features (caps_alternate, gst_caps_get_size (caps) - 1,
+        gst_caps_features_new (GST_CAPS_FEATURE_FORMAT_INTERLACED, NULL));
+  }
+
+  caps = gst_caps_merge (caps, caps_alternate);
+  caps = gst_kms_add_xlnx_ll_caps (caps, FALSE);
+
+  return caps;
 }
 
 static const gint device_par_map[][2] = {

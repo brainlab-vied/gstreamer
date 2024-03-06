@@ -33,6 +33,7 @@ G_BEGIN_DECLS
 GstVideoFormat gst_video_format_from_drm (guint32 drmfmt);
 guint32        gst_drm_format_from_video (GstVideoFormat fmt);
 guint32        gst_drm_bpp_from_drm (guint32 drmfmt);
+guint32        gst_drm_width_from_drm (guint32 drmfmt, guint32 width);
 guint32        gst_drm_height_from_drm (guint32 drmfmt, guint32 height);
 GstCaps *      gst_kms_sink_caps_template_fill (void);
 void           gst_video_calculate_device_ratio (guint dev_width,
@@ -41,6 +42,9 @@ void           gst_video_calculate_device_ratio (guint dev_width,
 						 guint dev_height_mm,
 						 guint * dpy_par_n,
 						 guint * dpy_par_d);
+
+GstCaps *      gst_kms_add_xlnx_ll_caps (GstCaps * caps, gboolean if_supported);
+extern gboolean is_dp;
 
 G_END_DECLS
 

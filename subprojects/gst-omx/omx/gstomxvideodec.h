@@ -32,7 +32,6 @@
 #include "gstomx.h"
 
 G_BEGIN_DECLS
-
 #define GST_TYPE_OMX_VIDEO_DEC \
   (gst_omx_video_dec_get_type())
 #define GST_OMX_VIDEO_DEC(obj) \
@@ -45,7 +44,6 @@ G_BEGIN_DECLS
   (G_TYPE_CHECK_INSTANCE_TYPE((obj),GST_TYPE_OMX_VIDEO_DEC))
 #define GST_IS_OMX_VIDEO_DEC_CLASS(obj) \
   (G_TYPE_CHECK_CLASS_TYPE((klass),GST_TYPE_OMX_VIDEO_DEC))
-
 typedef struct _GstOMXVideoDec GstOMXVideoDec;
 typedef struct _GstOMXVideoDecClass GstOMXVideoDecClass;
 
@@ -56,7 +54,7 @@ struct _GstOMXVideoDec
   /* < protected > */
   GstOMXComponent *dec;
   GstOMXPort *dec_in_port, *dec_out_port;
-  
+
   GstBufferPool *in_port_pool, *out_port_pool;
 
   /* < private > */
@@ -65,7 +63,7 @@ struct _GstOMXVideoDec
   /* TRUE if the component is configured and saw
    * the first buffer */
   gboolean started;
-   /* TRUE if the ports where disabled after being activated the first time. */
+  /* TRUE if the ports where disabled after being activated the first time. */
   gboolean disabled;
 
   GstClockTime last_upstream_ts;
@@ -74,7 +72,7 @@ struct _GstOMXVideoDec
   GMutex drain_lock;
   GCond drain_cond;
   /* TRUE if EOS buffers shouldn't be forwarded */
-  gboolean draining; /* protected by drain_lock */
+  gboolean draining;            /* protected by drain_lock */
 
   GstFlowReturn downstream_flow_ret;
   /* Initially FALSE. Switched to TRUE when all requirements
@@ -95,10 +93,22 @@ struct _GstOMXVideoDec
   /* TRUE if decoder is producing dmabuf */
   gboolean dmabuf;
   GstOMXBufferAllocation input_allocation;
+  /* Number of buffers allocated upstream */
+  guint nb_upstream_buffers;
+
+  /* TRUE if decoder is producing buffers using XLNX-LL */
+  gboolean xlnx_ll;
 
   /* properties */
-#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
   guint32 internal_entropy_buffers;
+  gboolean low_latency;
+  gboolean split_input;
+  gint32 output_position_x;
+  gint32 output_position_y;
+#ifdef USE_OMX_TARGET_VERSAL
+  gchar *device;
+#endif
 #endif
 };
 
@@ -108,12 +118,14 @@ struct _GstOMXVideoDecClass
 
   GstOMXClassData cdata;
 
-  gboolean (*is_format_change) (GstOMXVideoDec * self, GstOMXPort * port, GstVideoCodecState * state);
-  gboolean (*set_format)       (GstOMXVideoDec * self, GstOMXPort * port, GstVideoCodecState * state);
+  GMutex mutex;
+    gboolean (*is_format_change) (GstOMXVideoDec * self, GstOMXPort * port,
+      GstVideoCodecState * state);
+    gboolean (*set_format) (GstOMXVideoDec * self, GstOMXPort * port,
+      GstVideoCodecState * state);
 };
 
 GType gst_omx_video_dec_get_type (void);
 
 G_END_DECLS
-
 #endif /* __GST_OMX_VIDEO_DEC_H__ */

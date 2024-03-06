@@ -171,6 +171,9 @@ gst_h265_parse_init (GstH265Parse * h265parse)
   gst_base_parse_set_infer_ts (GST_BASE_PARSE (h265parse), FALSE);
   GST_PAD_SET_ACCEPT_INTERSECT (GST_BASE_PARSE_SINK_PAD (h265parse));
   GST_PAD_SET_ACCEPT_TEMPLATE (GST_BASE_PARSE_SINK_PAD (h265parse));
+
+  h265parse->aud_needed = TRUE;
+  h265parse->aud_insert = TRUE;
 }
 
 
@@ -202,6 +205,8 @@ gst_h265_parse_reset_frame (GstH265Parse * h265parse)
   h265parse->have_vps_in_frame = FALSE;
   h265parse->have_sps_in_frame = FALSE;
   h265parse->have_pps_in_frame = FALSE;
+  h265parse->frame_start = FALSE;
+  h265parse->aud_insert = FALSE;
   gst_adapter_clear (h265parse->frame_out);
 }
 
@@ -252,6 +257,8 @@ gst_h265_parse_reset_stream_info (GstH265Parse * h265parse)
 
   gst_video_content_light_level_init (&h265parse->content_light_level);
   h265parse->content_light_level_state = GST_H265_PARSE_SEI_EXPIRED;
+
+  h265parse->alt_transfer_char_state = GST_H265_PARSE_SEI_EXPIRED;
 }
 
 static void
@@ -669,6 +676,27 @@ gst_h265_parse_process_sei (GstH265Parse * h265parse, GstH265NalUnit * nalu)
 
         break;
       }
+      case GST_H265_SEI_ALTERNATIVE_TRANSFER_CHARACTERISTICS:
+      {
+        guint8 ptc;
+
+        ptc = sei.payload.alt_transfer_char.preferred_transfer_characteristics;
+
+        GST_LOG_OBJECT (h265parse,
+            "alternative transfer characteristics found: "
+            "preferred transfer characteristic:(%u)", ptc);
+
+        if (h265parse->alt_transfer_char_state == GST_H265_PARSE_SEI_EXPIRED) {
+          h265parse->update_caps = TRUE;
+        } else if (ptc != h265parse->preferred_transfer_char) {
+          h265parse->update_caps = TRUE;
+        }
+
+        h265parse->alt_transfer_char_state = GST_H265_PARSE_SEI_PARSED;
+        h265parse->preferred_transfer_char = ptc;
+
+        break;
+      }
       default:
         break;
     }
@@ -827,7 +855,6 @@ gst_h265_parse_process_nal (GstH265Parse * h265parse, GstH265NalUnit * nalu)
       h265parse->state |= GST_H265_PARSE_STATE_GOT_PPS;
       break;
     case GST_H265_NAL_PREFIX_SEI:
-    case GST_H265_NAL_SUFFIX_SEI:
       /* expected state: got-sps */
       if (!GST_H265_PARSE_STATE_VALID (h265parse, GST_H265_PARSE_STATE_GOT_SPS))
         return FALSE;
@@ -837,7 +864,7 @@ gst_h265_parse_process_nal (GstH265Parse * h265parse, GstH265NalUnit * nalu)
       gst_h265_parse_process_sei (h265parse, nalu);
 
       /* mark SEI pos */
-      if (nal_type == GST_H265_NAL_PREFIX_SEI && h265parse->sei_pos == -1) {
+      if (h265parse->sei_pos == -1) {
         if (h265parse->transform)
           h265parse->sei_pos = gst_adapter_available (h265parse->frame_out);
         else
@@ -845,6 +872,14 @@ gst_h265_parse_process_nal (GstH265Parse * h265parse, GstH265NalUnit * nalu)
         GST_DEBUG_OBJECT (h265parse, "marking SEI in frame at offset %d",
             h265parse->sei_pos);
       }
+      break;
+
+    case GST_H265_NAL_SUFFIX_SEI:
+      /* expected state: got-slice */
+      if (!GST_H265_PARSE_STATE_VALID (h265parse,
+              GST_H265_PARSE_STATE_GOT_SLICE))
+        return FALSE;
+      gst_h265_parse_process_sei (h265parse, nalu);
       break;
 
     case GST_H265_NAL_SLICE_TRAIL_N:
@@ -890,9 +925,11 @@ gst_h265_parse_process_nal (GstH265Parse * h265parse, GstH265NalUnit * nalu)
 
         h265parse->state |= GST_H265_PARSE_STATE_GOT_SLICE;
       }
-      if (slice.first_slice_segment_in_pic_flag == 1)
+      if (slice.first_slice_segment_in_pic_flag == 1) {
         GST_DEBUG_OBJECT (h265parse,
             "frame start, first_slice_segment_in_pic_flag = 1");
+        h265parse->frame_start = TRUE;
+      }
 
       GST_DEBUG_OBJECT (h265parse,
           "parse result %d, first slice_segment: %u, slice type: %u",
@@ -928,6 +965,12 @@ gst_h265_parse_process_nal (GstH265Parse * h265parse, GstH265NalUnit * nalu)
         else if (h265parse->content_light_level_state ==
             GST_H265_PARSE_SEI_ACTIVE)
           h265parse->content_light_level_state = GST_H265_PARSE_SEI_EXPIRED;
+
+        if (h265parse->alt_transfer_char_state == GST_H265_PARSE_SEI_PARSED)
+          h265parse->alt_transfer_char_state = GST_H265_PARSE_SEI_ACTIVE;
+        else if (h265parse->alt_transfer_char_state ==
+            GST_H265_PARSE_SEI_ACTIVE)
+          h265parse->alt_transfer_char_state = GST_H265_PARSE_SEI_EXPIRED;
       }
       if (G_LIKELY (!is_irap && !h265parse->push_codec))
         break;
@@ -959,6 +1002,7 @@ gst_h265_parse_process_nal (GstH265Parse * h265parse, GstH265NalUnit * nalu)
       pres = gst_h265_parser_parse_nal (nalparser, nalu);
       if (pres != GST_H265_PARSER_OK)
         return FALSE;
+      h265parse->aud_needed = FALSE;
       break;
   }
 
@@ -1044,6 +1088,10 @@ gst_h265_parse_handle_frame_packetized (GstBaseParse * parse,
 
   parse_res = gst_h265_parser_identify_nalu_hevc (h265parse->nalparser,
       map.data, 0, map.size, nl, &nalu);
+
+  /* there is no AUD in AVC, always enable insertion, the pre_push function
+   * will only add it once, and will only add it for byte-stream output. */
+  h265parse->aud_insert = TRUE;
 
   while (parse_res == GST_H265_PARSER_OK) {
     GST_DEBUG_OBJECT (h265parse, "HEVC nal offset %d", nalu.offset + nalu.size);
@@ -1291,7 +1339,23 @@ gst_h265_parse_handle_frame (GstBaseParse * parse,
     GST_DEBUG_OBJECT (h265parse, "%p complete nal found. Off: %u, Size: %u",
         data, nalu.offset, nalu.size);
 
+    if (!nonext) {
+      /* expect at least 3 bytes start_code, and 2 bytes NALU header.
+       * the length of the NALU payload can be zero.
+       * (e.g. EOS/EOB placed at the end of an AU.) */
+      if (nalu.offset + nalu.size + 3 + 2 > size) {
+        GST_DEBUG_OBJECT (h265parse, "not enough data for next NALU");
+        if (drain) {
+          GST_DEBUG_OBJECT (h265parse, "but draining anyway");
+          nonext = TRUE;
+        } else {
+          goto more;
+        }
+      }
+    }
+
     if (gst_h265_parse_collect_nal (h265parse, data, size, &nalu)) {
+      h265parse->aud_needed = TRUE;
       /* complete current frame, if it exist */
       if (current_off > 0) {
         nalu.size = 0;
@@ -1316,24 +1380,36 @@ gst_h265_parse_handle_frame (GstBaseParse * parse,
             GST_H265_PARSE_STATE_VALID_PICTURE_HEADERS))
       frame->flags |= GST_BASE_PARSE_FRAME_FLAG_QUEUE;
 
-    if (nonext) {
-      /* If there is a marker flag, or input is AU, we know this is complete */
-      if (GST_BUFFER_FLAG_IS_SET (frame->buffer, GST_BUFFER_FLAG_MARKER) ||
-          h265parse->in_align == GST_H265_PARSE_ALIGN_AU) {
-        h265parse->marker = TRUE;
-        break;
-      }
+    /* Make sure the next buffer will contain an AUD */
+    if (h265parse->aud_needed) {
+      h265parse->aud_insert = TRUE;
+      h265parse->aud_needed = FALSE;
+    }
 
-      /* or if we are draining or producing NALs */
-      if (drain || h265parse->align == GST_H265_PARSE_ALIGN_NAL)
-        break;
+    if (nonext) {
+      /* We may have complete frame if we have valid header */
+      if (GST_H265_PARSE_STATE_VALID (h265parse,
+              GST_H265_PARSE_STATE_VALID_PICTURE_HEADERS)) {
+        /* If there is a marker flag, or input is AU */
+        if (GST_BUFFER_FLAG_IS_SET (frame->buffer, GST_BUFFER_FLAG_MARKER) ||
+            h265parse->in_align == GST_H265_PARSE_ALIGN_AU) {
+          h265parse->marker = TRUE;
+          break;
+        }
+
+        /* or if we are draining or producing NALs */
+        if (drain || h265parse->align == GST_H265_PARSE_ALIGN_NAL)
+          break;
+      }
 
       current_off = nalu.offset + nalu.size;
       goto more;
     }
 
-    /* If the output is NAL, we are done */
-    if (h265parse->align == GST_H265_PARSE_ALIGN_NAL)
+    /* If the output is NAL and have valid header, we are done */
+    if (h265parse->align == GST_H265_PARSE_ALIGN_NAL &&
+        GST_H265_PARSE_STATE_VALID (h265parse,
+            GST_H265_PARSE_STATE_VALID_PICTURE_HEADERS))
       break;
 
     GST_DEBUG_OBJECT (h265parse, "Looking for more");
@@ -2315,6 +2391,26 @@ gst_h265_parse_update_src_caps (GstH265Parse * h265parse, GstCaps * caps)
             bit_depth_chroma, NULL);
 
       if (colorimetry && (!s || !gst_structure_has_field (s, "colorimetry"))) {
+        if (h265parse->alt_transfer_char_state != GST_H265_PARSE_SEI_EXPIRED) {
+          GstVideoColorimetry ci = { 0, };
+          gboolean ret;
+
+          ret = gst_video_colorimetry_from_string (&ci, colorimetry);
+          if (ret
+              && ci.transfer !=
+              gst_video_transfer_function_from_iso
+              (h265parse->preferred_transfer_char)) {
+            ci.transfer =
+                gst_video_transfer_function_from_iso
+                (h265parse->preferred_transfer_char);
+
+            g_free (colorimetry);
+            colorimetry = gst_video_colorimetry_to_string (&ci);
+            GST_DEBUG_OBJECT (h265parse,
+                "Forcing colorimetry to %s due to ATC SEI", colorimetry);
+          }
+        }
+
         gst_caps_set_simple (caps, "colorimetry", G_TYPE_STRING, colorimetry,
             NULL);
       }
@@ -2445,6 +2541,10 @@ gst_h265_parse_update_src_caps (GstH265Parse * h265parse, GstCaps * caps)
 
       if (profile != NULL)
         gst_caps_set_simple (caps, "profile", G_TYPE_STRING, profile, NULL);
+
+      if (sps->profile_tier_level.interlaced_source_flag)
+        gst_caps_set_simple (caps, "interlace-mode", G_TYPE_STRING,
+            "interleaved", NULL);
 
       tier = get_tier_string (sps->profile_tier_level.tier_flag);
       if (tier != NULL)
@@ -2583,13 +2683,16 @@ gst_h265_parse_parse_frame (GstBaseParse * parse, GstBaseParseFrame * frame)
 
   gst_h265_parse_update_src_caps (h265parse, NULL);
 
-  if (h265parse->fps_num > 0 && h265parse->fps_den > 0) {
+  if (h265parse->frame_start && h265parse->fps_num > 0 &&
+      h265parse->fps_den > 0) {
     GstClockTime val =
         gst_h265_parse_is_field_interlaced (h265parse) ? GST_SECOND /
         2 : GST_SECOND;
 
     GST_BUFFER_DURATION (buffer) = gst_util_uint64_scale (val,
         h265parse->fps_den, h265parse->fps_num);
+  } else {
+    GST_BUFFER_DURATION (buffer) = 0;
   }
 
   if (h265parse->keyframe)
@@ -2656,6 +2759,10 @@ gst_h265_parse_push_codec_buffer (GstH265Parse * h265parse, GstBuffer * nal,
   if (h265parse->discont) {
     GST_BUFFER_FLAG_SET (nal, GST_BUFFER_FLAG_DISCONT);
     h265parse->discont = FALSE;
+  }
+
+  if (GST_BUFFER_FLAG_IS_SET (buffer, GST_BUFFER_FLAG_DELTA_UNIT)) {
+    GST_BUFFER_FLAG_SET (nal, GST_BUFFER_FLAG_DELTA_UNIT);
   }
 
   GST_BUFFER_PTS (nal) = GST_BUFFER_PTS (buffer);
@@ -2880,6 +2987,12 @@ gst_h265_parse_handle_vps_sps_pps_nals (GstH265Parse * h265parse,
   return send_done;
 }
 
+static guint8 au_delim[7] = {
+  0x00, 0x00, 0x00, 0x01,       /* nal prefix */
+  0x46, 0x01,                   /* nal unit type = access unit delimiter */
+  0x50                          /* allow any slice type */
+};
+
 static GstFlowReturn
 gst_h265_parse_pre_push_frame (GstBaseParse * parse, GstBaseParseFrame * frame)
 {
@@ -2918,7 +3031,34 @@ gst_h265_parse_pre_push_frame (GstBaseParse * parse, GstBaseParseFrame * frame)
     h265parse->first_frame = FALSE;
   }
 
-  buffer = frame->buffer;
+  /* In case of byte-stream, insert au delimeter by default
+   * if it doesn't exist */
+  if (h265parse->aud_insert && h265parse->format == GST_H265_PARSE_FORMAT_BYTE) {
+    GST_DEBUG_OBJECT (h265parse, "Inserting AUD into the stream.");
+    if (h265parse->align == GST_H265_PARSE_ALIGN_AU) {
+      GstMemory *mem =
+          gst_memory_new_wrapped (GST_MEMORY_FLAG_READONLY, (guint8 *) au_delim,
+          sizeof (au_delim), 0, sizeof (au_delim), NULL, NULL);
+
+      frame->out_buffer = gst_buffer_copy (frame->buffer);
+      gst_buffer_prepend_memory (frame->out_buffer, mem);
+      if (h265parse->idr_pos >= 0)
+        h265parse->idr_pos += sizeof (au_delim);
+
+      buffer = frame->out_buffer;
+    } else {
+      GstBuffer *aud_buffer = gst_buffer_new_allocate (NULL,
+          sizeof (au_delim) - 4, NULL);
+      gst_buffer_fill (aud_buffer, 0, (guint8 *) (au_delim + 4),
+          sizeof (au_delim) - 4);
+
+      buffer = frame->buffer;
+      gst_h265_parse_push_codec_buffer (h265parse, aud_buffer, buffer);
+      gst_buffer_unref (aud_buffer);
+    }
+  } else {
+    buffer = frame->buffer;
+  }
 
   if ((event = check_pending_key_unit_event (h265parse->force_key_unit_event,
               &parse->segment, GST_BUFFER_TIMESTAMP (buffer),

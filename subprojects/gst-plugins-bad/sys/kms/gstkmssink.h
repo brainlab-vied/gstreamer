@@ -30,7 +30,6 @@
 #include <gst/video/video-hdr.h>
 
 G_BEGIN_DECLS
-
 #define GST_TYPE_KMS_SINK \
   (gst_kms_sink_get_type())
 #define GST_KMS_SINK(obj) \
@@ -41,23 +40,41 @@ G_BEGIN_DECLS
   (G_TYPE_CHECK_INSTANCE_TYPE((obj), GST_TYPE_KMS_SINK))
 #define GST_IS_KMS_SINK_CLASS(klass) \
   (G_TYPE_CHECK_CLASS_TYPE((klass), GST_TYPE_KMS_SINK))
-
 typedef struct _GstKMSSink GstKMSSink;
 typedef struct _GstKMSSinkClass GstKMSSinkClass;
 
-struct _GstKMSSink {
+typedef struct
+{
+  guint xmin;
+  guint ymin;
+  guint width;
+  guint height;
+} roi_coordinate;
+
+typedef struct
+{
+  guint count;
+  guint ts;
+  roi_coordinate *coordinate_param;
+} roi_params;
+
+struct _GstKMSSink
+{
   GstVideoSink videosink;
 
-  /*< private >*/
+  /*< private > */
   gint fd;
   gint conn_id;
   gint crtc_id;
   gint plane_id;
+  gint primary_plane_id;
+  guint error_correction_margin;
   guint pipe;
 
   /* crtc data */
   guint16 hdisplay, vdisplay;
   guint32 buffer_id;
+  gpointer saved_crtc;
 
   /* capabilities */
   gboolean has_prime_import;
@@ -67,10 +84,18 @@ struct _GstKMSSink {
 
   gboolean modesetting_enabled;
   gboolean restore_crtc;
+  gboolean hold_extra_sample;
+  gboolean do_timestamp;
+  gboolean avoid_field_inversion;
+  gboolean fix_field_inversion;
+  gboolean adjust_latency;
+  gboolean limit_error_recovery;
   GstStructure *connector_props;
   GstStructure *plane_props;
-
+  gboolean fullscreen_enabled;
+  gboolean is_last_err_corrected;
   GstVideoInfo vinfo;
+  GstVideoInfo vinfo_crtc;
   GstCaps *allowed_caps;
   GstBufferPool *pool;
   GstAllocator *allocator;
@@ -78,13 +103,13 @@ struct _GstKMSSink {
   guint last_width;
   guint last_height;
   GstBuffer *last_buffer;
+  GstBuffer *previous_last_buffer;
   GstMemory *tmp_kmsmem;
 
   gchar *devname;
   gchar *bus_id;
 
   guint32 mm_width, mm_height;
-  gpointer saved_crtc;
   GstPoll *poll;
   GstPollFD pollfd;
 
@@ -94,6 +119,24 @@ struct _GstKMSSink {
   /* reconfigure info if driver doesn't scale */
   GstVideoRectangle pending_rect;
   gboolean reconfigure;
+
+  gboolean xlnx_ll;
+  /* timestamp of last vblank */
+  GstClockTime last_vblank;
+  /* timestamp of previous to last vblank */
+  GstClockTime prev_last_vblank;
+  GstClockTime last_ts;
+  GstClockTime last_orig_ts;
+  GstClockTime last_err_corrected_ts;
+
+  gboolean force_ntsc_tv;
+  gboolean gray_to_yuv444;
+
+  /* roi data */
+  gboolean draw_roi;
+  guint roi_rect_thickness;
+  GValue roi_rect_yuv_color;
+  roi_params roi_param;
 
   gboolean is_internal_fd;
   gboolean skip_vsync;

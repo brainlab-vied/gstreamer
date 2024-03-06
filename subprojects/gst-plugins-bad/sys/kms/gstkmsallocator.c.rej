@@ -1,0 +1,11 @@
+--- subprojects/gst-plugins-bad/sys/kms/gstkmsallocator.c	2024-02-27 16:56:02.370335956 +0100
++++ subprojects/gst-plugins-bad/sys/kms/gstkmsallocator.c	2024-02-27 17:20:31.375804317 +0100
+@@ -176,6 +201,8 @@
+     case GST_VIDEO_FORMAT_NV16:
+     case GST_VIDEO_FORMAT_NV61:
+     case GST_VIDEO_FORMAT_NV24:
++    case GST_VIDEO_FORMAT_NV12_10LE32:
++    case GST_VIDEO_FORMAT_NV16_10LE32:
+     case GST_VIDEO_FORMAT_P010_10LE:
+     case GST_VIDEO_FORMAT_P010_10BE:
+     case GST_VIDEO_FORMAT_P016_LE:

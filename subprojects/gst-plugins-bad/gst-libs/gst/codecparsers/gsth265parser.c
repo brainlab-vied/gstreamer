@@ -306,6 +306,10 @@ static const struct h265_profile_string h265_profiles[] = {
   {GST_H265_PROFILE_SCALABLE_MONOCHROME_16, "scalable-monochrome-16"},
   {GST_H265_PROFILE_SCALABLE_MAIN_444, "scalable-main-444"},
   {GST_H265_PROFILE_3D_MAIN, "3d-main"},
+  /* Xilinx specific */
+  {GST_H265_PROFILE_MAIN_422_XILINX, "main-422"},
+  {GST_H265_PROFILE_MONOCHROME_10_XILINX, "monochrome-10"},
+  {GST_H265_PROFILE_MAIN_422_INTRA_XILINX, "main-422-intra"},
 };
 
 /****** Parsing functions *****/
@@ -1339,6 +1343,21 @@ gst_h265_parser_parse_content_light_level_info (GstH265Parser * parser,
 
 error:
   GST_WARNING ("error parsing \"Content light level\"");
+  return GST_H265_PARSER_ERROR;
+}
+
+static GstH265ParserResult
+gst_h265_parser_parse_alternative_transfer_characteristics (GstH265Parser *
+    parser, GstH265AlternativeTransferCharacteristics * atc, NalReader * nr)
+{
+  GST_DEBUG ("parsing \"Alternative transfer characteristics\"");
+
+  READ_UINT8 (nr, atc->preferred_transfer_characteristics, 8);
+
+  return GST_H265_PARSER_OK;
+
+error:
+  GST_WARNING ("error parsing \"Alternative transfer characteristics\"");
   return GST_H265_PARSER_ERROR;
 }
 
@@ -3085,6 +3104,11 @@ gst_h265_parser_parse_sei_message (GstH265Parser * parser,
         res = gst_h265_parser_parse_content_light_level_info (parser,
             &sei->payload.content_light_level, nr);
         break;
+      case GST_H265_SEI_ALTERNATIVE_TRANSFER_CHARACTERISTICS:
+        res =
+            gst_h265_parser_parse_alternative_transfer_characteristics (parser,
+            &sei->payload.alt_transfer_char, nr);
+        break;
       default:
         /* Just consume payloadSize bytes, which does not account for
            emulation prevention bytes */
@@ -3808,6 +3832,13 @@ get_format_range_extension_profile (const GstH265ProfileTierLevel * ptl)
         0, 1, 1, 1, 0, 0, 0, 1, 1, FALSE, 19},
     {GST_H265_PROFILE_MAIN_444_16_STILL_PICTURE,
         0, 0, 0, 0, 0, 0, 0, 1, 1, FALSE, 20},
+    /* Xilinx specific */
+    /* main-422-10 + max_8bit_constraint_flag */
+    {GST_H265_PROFILE_MAIN_422_XILINX, 0, 1, 1, 1, 1, 0, 0, 0, 0, TRUE, 4},
+    /* monochrome-12 + max_10bit_constraint_flag */
+    {GST_H265_PROFILE_MONOCHROME_10_XILINX, 0, 1, 1, 0, 1, 1, 1, 0, 0, TRUE, 1},
+    /* main-422-10-intra + max_8bit_constraint_flag  */
+    {GST_H265_PROFILE_MAIN_422_INTRA_XILINX, 0, 1, 1, 1, 1, 0, 0, 1, 0, FALSE, 12},
   };
 
   return get_extension_profile (profiles, G_N_ELEMENTS (profiles), ptl);
