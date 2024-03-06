@@ -32,7 +32,7 @@ typedef struct
 
 static const H264ProfileMapping h264_profiles[] = {
   {"baseline", OMX_VIDEO_AVCProfileBaseline},
-#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
   {"constrained-baseline",
       (OMX_VIDEO_AVCPROFILETYPE) OMX_ALG_VIDEO_AVCProfileConstrainedBaseline},
 #else
@@ -42,7 +42,7 @@ static const H264ProfileMapping h264_profiles[] = {
   {"high", OMX_VIDEO_AVCProfileHigh},
   {"high-10", OMX_VIDEO_AVCProfileHigh10},
   {"high-4:2:2", OMX_VIDEO_AVCProfileHigh422},
-#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
   {"progressive-high",
       (OMX_VIDEO_AVCPROFILETYPE) OMX_ALG_VIDEO_AVCProfileProgressiveHigh},
   {"constrained-high",
@@ -51,6 +51,22 @@ static const H264ProfileMapping h264_profiles[] = {
       (OMX_VIDEO_AVCPROFILETYPE) OMX_ALG_VIDEO_AVCProfileHigh10_Intra},
   {"high-4:2:2-intra",
       (OMX_VIDEO_AVCPROFILETYPE) OMX_ALG_VIDEO_AVCProfileHigh422_Intra},
+  {"xavc-high-10-intra-cbg",
+      (OMX_VIDEO_AVCPROFILETYPE) OMX_ALG_VIDEO_XAVCProfileHigh10_Intra_CBG},
+  {"xavc-high-10-intra-vbr",
+      (OMX_VIDEO_AVCPROFILETYPE) OMX_ALG_VIDEO_XAVCProfileHigh10_Intra_VBR},
+  {"xavc-high-4:2:2-intra-cbg",
+      (OMX_VIDEO_AVCPROFILETYPE) OMX_ALG_VIDEO_XAVCProfileHigh422_Intra_CBG},
+  {"xavc-high-4:2:2-intra-vbr",
+      (OMX_VIDEO_AVCPROFILETYPE) OMX_ALG_VIDEO_XAVCProfileHigh422_Intra_VBR},
+  {"xavc-long-gop-main-mp4",
+      (OMX_VIDEO_AVCPROFILETYPE) OMX_ALG_VIDEO_XAVCProfileLongGopMain_MP4},
+  {"xavc-long-gop-high-mp4",
+      (OMX_VIDEO_AVCPROFILETYPE) OMX_ALG_VIDEO_XAVCProfileLongGopHigh_MP4},
+  {"xavc-long-gop-high-mxf",
+      (OMX_VIDEO_AVCPROFILETYPE) OMX_ALG_VIDEO_XAVCProfileLongGopHigh_MXF},
+  {"xavc-long-gop-high-4:2:2-mxf",
+      (OMX_VIDEO_AVCPROFILETYPE) OMX_ALG_VIDEO_XAVCProfileLongGopHigh422_MXF},
 #endif
 };
 
@@ -115,10 +131,10 @@ gst_omx_h264_utils_get_level_from_str (const gchar * level)
     return OMX_VIDEO_AVCLevel5;
   } else if (g_str_equal (level, "5.1")) {
     return OMX_VIDEO_AVCLevel51;
-#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
   } else if (g_str_equal (level, "5.2")) {
     return (OMX_VIDEO_AVCLEVELTYPE) OMX_ALG_VIDEO_AVCLevel52;
-  } else if (g_str_equal (level, "6.0")) {
+  } else if (g_str_equal (level, "6")) {
     return (OMX_VIDEO_AVCLEVELTYPE) OMX_ALG_VIDEO_AVCLevel60;
   } else if (g_str_equal (level, "6.1")) {
     return (OMX_VIDEO_AVCLEVELTYPE) OMX_ALG_VIDEO_AVCLevel61;

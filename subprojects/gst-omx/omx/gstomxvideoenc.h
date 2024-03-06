@@ -28,7 +28,6 @@
 #include "gstomx.h"
 
 G_BEGIN_DECLS
-
 #define GST_TYPE_OMX_VIDEO_ENC \
   (gst_omx_video_enc_get_type())
 #define GST_OMX_VIDEO_ENC(obj) \
@@ -41,7 +40,6 @@ G_BEGIN_DECLS
   (G_TYPE_CHECK_INSTANCE_TYPE((obj),GST_TYPE_OMX_VIDEO_ENC))
 #define GST_IS_OMX_VIDEO_ENC_CLASS(obj) \
   (G_TYPE_CHECK_CLASS_TYPE((klass),GST_TYPE_OMX_VIDEO_ENC))
-
 typedef struct _GstOMXVideoEnc GstOMXVideoEnc;
 typedef struct _GstOMXVideoEncClass GstOMXVideoEncClass;
 
@@ -58,23 +56,26 @@ struct _GstOMXVideoEnc
   /* TRUE if the component is configured and saw
    * the first buffer */
   gboolean started;
-   /* TRUE if the ports where disabled after being activated the first time. */
+  /* TRUE if the ports where disabled after being activated the first time. */
   gboolean disabled;
 
   GstClockTime last_upstream_ts;
+  GstClockTime xlnx_ll_start;
+  GstClockTime xlnx_ll_end;
 
   /* Draining state */
   GMutex drain_lock;
   GCond drain_cond;
   /* TRUE if EOS buffers shouldn't be forwarded */
-  gboolean draining; /* protected by drain_lock */
+  gboolean draining;            /* protected by drain_lock */
 
   /* properties */
   guint32 control_rate;
-  guint32 target_bitrate; /* protected by object lock */
+  guint32 target_bitrate;       /* protected by object lock */
   guint32 quant_i_frames;
   guint32 quant_p_frames;
   guint32 quant_b_frames;
+  gboolean use_out_port_pool;
 #ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
   guint32 qp_mode;
   guint32 min_qp;
@@ -86,16 +87,45 @@ struct _GstOMXVideoEnc
   guint32 scaling_list;
   gboolean low_bandwidth;
   guint32 max_bitrate;
+  guint32 max_quality_target;
   guint32 aspect_ratio;
   gboolean filler_data;
   guint32 num_slices;
   guint32 slice_size;
   gboolean dependent_slice;
   gint default_roi_quality;
+  gboolean prefetch_buffer;
+  guint32 latency_mode;
   gboolean long_term_ref;
   guint32 long_term_freq;
   guint32 look_ahead;
+  gboolean skip_frame;
+  guint32 max_picture_size;
+  guint32 max_picture_size_i;
+  guint32 max_picture_size_p;
+  guint32 max_picture_size_b;
+  guint32 max_consecutive_skip;
+  guint32 output_crop_left;
+  guint32 output_crop_top;
+  guint32 output_crop_width;
+  guint32 output_crop_height;
+  guint32 xavc_max_picture_size_in_bits_i;
+  guint32 xavc_max_picture_size_in_bits_p;
+  guint32 xavc_max_picture_size_in_bits_b;
+  gboolean uniform_slice_type;
+  guint32 input_crop_left;
+  guint32 input_crop_top;
+  guint32 input_crop_width;
+  guint32 input_crop_height;
+  gboolean hlg_sdr_compatible;
+  gboolean is_yuv444;
 #endif
+
+  /* for HDR10 support */
+  GstVideoMasteringDisplayInfo minfo;
+  GstVideoContentLightLevel linfo;
+  gboolean has_mcdv_sei;
+  gboolean has_cll_sei;
 
   guint32 default_target_bitrate;
 
@@ -104,11 +134,18 @@ struct _GstOMXVideoEnc
   GstOMXBufferAllocation input_allocation;
   /* TRUE if encoder is passing dmabuf's fd directly to the OMX component */
   gboolean input_dmabuf;
+  /* Number of buffers allocated upstream */
+  guint nb_upstream_buffers;
   /* Number of buffers requested downstream */
   guint nb_downstream_buffers;
 
   /* TRUE if input buffers are from the pool we proposed to upstream */
   gboolean in_pool_used;
+
+  GstBufferPool *out_port_pool;
+
+  /* TRUE if encoder is receiving input using XLNX-LL */
+  gboolean xlnx_ll;
 
 #ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
   GEnumClass *alg_roi_quality_enum_class;
@@ -121,13 +158,16 @@ struct _GstOMXVideoEncClass
 
   GstOMXClassData cdata;
 
-  gboolean            (*set_format)          (GstOMXVideoEnc * self, GstOMXPort * port, GstVideoCodecState * state);
-  GstCaps            *(*get_caps)           (GstOMXVideoEnc * self, GstOMXPort * port, GstVideoCodecState * state);
-  GstFlowReturn       (*handle_output_frame) (GstOMXVideoEnc * self, GstOMXPort * port, GstOMXBuffer * buffer, GstVideoCodecFrame * frame);
+    gboolean (*set_format) (GstOMXVideoEnc * self, GstOMXPort * port,
+      GstVideoCodecState * state);
+  GstCaps *(*get_caps) (GstOMXVideoEnc * self, GstOMXPort * port,
+      GstVideoCodecState * state);
+    GstFlowReturn (*handle_output_frame) (GstOMXVideoEnc * self,
+      GstOMXPort * port, GstBuffer * outbuf, GstOMXBuffer * buffer,
+      GstVideoCodecFrame * frame);
 };
 
 GType gst_omx_video_enc_get_type (void);
 
 G_END_DECLS
-
 #endif /* __GST_OMX_VIDEO_ENC_H__ */

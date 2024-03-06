@@ -59,7 +59,7 @@ G_DEFINE_TYPE_WITH_CODE (GstOMXH264Dec, gst_omx_h264_dec,
 /* The Zynq supports decoding subframes, though we want "au" to be the
  * default, so we keep it prepended. This is the only way that it works with
  * rtph264depay. */
-#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
 #define SINK_CAPS MAKE_CAPS ("au") ";" MAKE_CAPS ("nal")
 #else
 #define SINK_CAPS MAKE_CAPS ("au")
@@ -150,8 +150,11 @@ set_profile_and_level (GstOMXH264Dec * self, GstVideoCodecState * state)
     goto unsupported_profile;
 
   level_string = gst_structure_get_string (s, "level");
-  if (!level_string)
-    return TRUE;
+  if (!level_string) {
+    /* HACK: use higher level/tier if not specified (invalid stream) so we can decode it */
+    GST_DEBUG_OBJECT (self, "level not specified, use 6.2");
+    level_string = "6.2";
+  }
 
   param.eLevel = gst_omx_h264_utils_get_level_from_str (level_string);
   if (param.eLevel == OMX_VIDEO_AVCLevelMax)
@@ -183,6 +186,21 @@ unsupported_profile:
 unsupported_level:
   GST_ERROR_OBJECT (self, "Unsupported level %s", level_string);
   return FALSE;
+}
+
+static gboolean
+set_subframe_mode (GstOMXVideoDec * self, GstVideoCodecState * state)
+{
+  const GstStructure *s;
+  const gchar *alignment;
+  gboolean enabled;
+
+  s = gst_caps_get_structure (state->caps, 0);
+  alignment = gst_structure_get_string (s, "alignment");
+  enabled = g_strcmp0 (alignment, "nal") == 0;
+  gst_video_decoder_set_subframe_mode (GST_VIDEO_DECODER (self), enabled);
+  GST_DEBUG_OBJECT (self, "subframe mode %d", enabled);
+  return gst_omx_port_set_subframe (self->dec_in_port, enabled);
 }
 
 static gboolean

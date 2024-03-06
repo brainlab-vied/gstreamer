@@ -350,6 +350,10 @@ struct _GstVideoDecoderPrivate
   /* whether input is considered as subframes */
   gboolean subframe_mode;
 
+  /* whether input is considered as subframes
+   * and subclass supports XLNXLL */
+  gboolean xlnx_ll;
+
   /* Error handling */
   gint max_errors;
   gint error_count;
@@ -784,6 +788,8 @@ gst_video_decoder_init (GstVideoDecoder * decoder, GstVideoDecoderClass * klass)
       DEFAULT_AUTOMATIC_REQUEST_SYNC_POINTS;
   decoder->priv->automatic_request_sync_point_flags =
       DEFAULT_AUTOMATIC_REQUEST_SYNC_POINT_FLAGS;
+
+  decoder->priv->xlnx_ll = FALSE;
 
   gst_video_decoder_reset (decoder, TRUE, TRUE);
 }
@@ -2428,7 +2434,7 @@ gst_video_decoder_chain_forward (GstVideoDecoder * decoder,
   GstVideoDecoderPrivate *priv;
   GstVideoDecoderClass *klass;
   GstFlowReturn ret = GST_FLOW_OK;
-
+  
   klass = GST_VIDEO_DECODER_GET_CLASS (decoder);
   priv = decoder->priv;
 
@@ -2449,10 +2455,24 @@ gst_video_decoder_chain_forward (GstVideoDecoder * decoder,
 
   priv->input_offset += gst_buffer_get_size (buf);
 
+
   if (priv->packetized) {
     GstVideoCodecFrame *frame;
     gboolean was_keyframe = FALSE;
 
+    /* In subframe mode, If we are still using same frame and receive new PTS
+     * buffer mode before all subframes of previous frame are received then it
+     * means we have lost packets corresponding to previous frame so release
+     * previous frame reference and start with a new frame */
+    if (priv->current_frame != NULL && decoder->priv->subframe_mode) {
+      if ((GST_BUFFER_PTS_IS_VALID (buf) &&
+              GST_BUFFER_PTS (buf) > priv->current_frame->pts)) {
+        GST_INFO_OBJECT (decoder,
+            "Create new frame as buf with new PTS received");
+        gst_video_codec_frame_unref (priv->current_frame);
+        priv->current_frame = gst_video_decoder_new_frame (decoder);
+      }
+    }
     frame = priv->current_frame;
 
     frame->abidata.ABI.num_subframes++;
@@ -2477,7 +2497,6 @@ gst_video_decoder_chain_forward (GstVideoDecoder * decoder,
 
     if (decoder->input_segment.rate < 0.0) {
       priv->parse_gather = g_list_prepend (priv->parse_gather, frame);
-      priv->current_frame = NULL;
     } else {
       ret = gst_video_decoder_decode_frame (decoder, frame);
       if (!gst_video_decoder_get_subframe_mode (decoder))
@@ -3199,6 +3218,12 @@ gst_video_decoder_release_frame (GstVideoDecoder * dec,
         g_list_concat (frame->events, dec->priv->pending_events);
     frame->events = NULL;
   }
+
+  if (dec->priv->current_frame == frame) {
+    dec->priv->current_frame = NULL;
+    gst_video_codec_frame_unref (frame);
+  }
+
   GST_VIDEO_DECODER_STREAM_UNLOCK (dec);
 
   /* unref because this function takes ownership */
@@ -3322,6 +3347,14 @@ gst_video_decoder_transform_meta_default (GstVideoDecoder *
     NULL,
   };
 
+  /* By default, only keep the first instance of a meta, subclasses
+   * are free to do otherwise.
+   */
+  if (frame->output_buffer != NULL) {
+    if (gst_buffer_get_meta (frame->output_buffer, info->type))
+      return FALSE;
+  }
+
   tags = gst_meta_api_type_get_tags (info->api);
 
   if (!tags)
@@ -3370,11 +3403,21 @@ foreach_metadata (GstBuffer * inbuf, GstMeta ** meta, gpointer user_data)
    * function and when it returns %TRUE */
   if (do_copy && info->transform_func) {
     GstMetaTransformCopy copy_data = { FALSE, 0, -1 };
+    GstBuffer *buffer;
+
     GST_DEBUG_OBJECT (decoder, "copy metadata %s", g_type_name (info->api));
     /* simply copy then */
 
+    buffer = frame->output_buffer;
+    if (G_UNLIKELY (buffer)) {
+      if (frame->abidata.ABI.meta_buffer == NULL)
+        frame->abidata.ABI.meta_buffer = gst_buffer_new ();
+      buffer = frame->abidata.ABI.meta_buffer;
+    }
+
     info->transform_func (buffer, *meta, inbuf, _gst_meta_transform_copy,
         &copy_data);
+
   }
   return TRUE;
 }
@@ -3406,8 +3449,6 @@ gst_video_decoder_replace_input_buffer (GstVideoDecoder * decoder,
 {
   if (frame->input_buffer) {
     *dest_buffer = gst_buffer_make_writable (*dest_buffer);
-    gst_video_decoder_copy_metas (decoder, frame, frame->input_buffer,
-        *dest_buffer);
     gst_buffer_unref (frame->input_buffer);
   }
 
@@ -3438,6 +3479,7 @@ gst_video_decoder_finish_frame (GstVideoDecoder * decoder,
   GstVideoDecoderPrivate *priv = decoder->priv;
   GstBuffer *output_buffer;
   gboolean needs_reconfigure = FALSE;
+  GstVideoCodecFrame *early_decoded_frame = NULL;
 
   GST_LOG_OBJECT (decoder, "finish frame %p", frame);
 
@@ -3535,6 +3577,9 @@ gst_video_decoder_finish_frame (GstVideoDecoder * decoder,
     GST_BUFFER_FLAG_SET (output_buffer, GST_BUFFER_FLAG_CORRUPTED);
   }
 
+  if (G_UNLIKELY (frame->abidata.ABI.meta_buffer))
+    gst_video_decoder_copy_metas (decoder, frame,
+        frame->abidata.ABI.meta_buffer, frame->output_buffer);
   gst_video_decoder_copy_metas (decoder, frame, frame->input_buffer,
       frame->output_buffer);
 
@@ -3547,8 +3592,28 @@ gst_video_decoder_finish_frame (GstVideoDecoder * decoder,
    * if possible, i.e. if the subclass does not hold additional references
    * to the frame
    */
+  if (decoder->priv->xlnx_ll && decoder->priv->current_frame == frame
+      && !GST_BUFFER_FLAG_IS_SET (frame->input_buffer,
+          GST_BUFFER_FLAG_MARKER)) {
+    GST_LOG_OBJECT (decoder,
+        "received early finish_frame in xlnx-ll mode. Save current_frame");
+    early_decoded_frame = gst_video_codec_frame_ref (frame);
+  }
   gst_video_decoder_release_frame (decoder, frame);
   frame = NULL;
+
+  if (decoder->priv->xlnx_ll && early_decoded_frame) {
+    GST_LOG_OBJECT (decoder,
+        "restore current_frame after frame %d is released in xlnx-ll mode",
+      early_decoded_frame->system_frame_number);
+    GST_VIDEO_CODEC_FRAME_FLAG_SET (early_decoded_frame,
+        GST_VIDEO_CODEC_FRAME_FLAG_XLNX_ALREADY_PUSHED);
+    decoder->priv->current_frame =
+        gst_video_codec_frame_ref (early_decoded_frame);
+    decoder->priv->current_frame->events = NULL;
+    gst_video_codec_frame_unref (early_decoded_frame);
+    early_decoded_frame = NULL;
+  }
 
   if (decoder->output_segment.rate < 0.0
       && !(decoder->output_segment.flags & GST_SEEK_FLAG_TRICKMODE_KEY_UNITS)) {
@@ -3888,7 +3953,6 @@ gst_video_decoder_have_frame (GstVideoDecoder * decoder)
     priv->current_frame = NULL;
   } else {
     GstVideoCodecFrame *frame = priv->current_frame;
-    frame->abidata.ABI.num_subframes++;
     /* In subframe mode, we keep a ref for ourselves
      * as this frame will be kept during the data collection
      * in parsed mode. The frame reference will be released by
@@ -3901,6 +3965,10 @@ gst_video_decoder_have_frame (GstVideoDecoder * decoder)
     /* Decode the frame, which gives away our ref */
     ret = gst_video_decoder_decode_frame (decoder, frame);
   }
+ 
+  if (!gst_video_decoder_get_subframe_mode (decoder) || !priv->current_frame->abidata.ABI.num_subframes)
+    priv->current_frame = NULL;
+
 
   GST_VIDEO_DECODER_STREAM_UNLOCK (decoder);
 
@@ -3925,9 +3993,28 @@ gst_video_decoder_decode_frame (GstVideoDecoder * decoder,
   g_return_val_if_fail (decoder_class->handle_frame != NULL, GST_FLOW_ERROR);
   g_return_val_if_fail (frame != NULL, GST_FLOW_ERROR);
 
-  frame->pts = GST_BUFFER_PTS (frame->input_buffer);
-  frame->dts = GST_BUFFER_DTS (frame->input_buffer);
-  frame->duration = GST_BUFFER_DURATION (frame->input_buffer);
+  if (frame->abidata.ABI.num_subframes == 1) {
+    frame->distance_from_sync = priv->distance_from_sync;
+    priv->distance_from_sync++;
+  }
+
+  /* The if() conditions are to work around bugs in h264parse that don't
+   * put the timestamp & duration correctly on some of the buffers if there
+   * is more than one buffer per frame.
+   */
+  if (!GST_CLOCK_TIME_IS_VALID (frame->pts) ||
+      (GST_BUFFER_PTS_IS_VALID (frame->input_buffer) &&
+          GST_BUFFER_PTS (frame->input_buffer) > frame->pts))
+    frame->pts = GST_BUFFER_PTS (frame->input_buffer);
+  if (!GST_CLOCK_TIME_IS_VALID (frame->dts) ||
+      (GST_BUFFER_DTS_IS_VALID (frame->input_buffer) &&
+          GST_BUFFER_DTS (frame->input_buffer) > frame->dts))
+    frame->dts = GST_BUFFER_DTS (frame->input_buffer);
+  if (!GST_CLOCK_TIME_IS_VALID (frame->duration) ||
+      (GST_BUFFER_DURATION_IS_VALID (frame->input_buffer) &&
+          GST_BUFFER_DURATION (frame->input_buffer) > frame->duration))
+    frame->duration = GST_BUFFER_DURATION (frame->input_buffer);
+  //NOTE: NEED REVIEW 
   frame->deadline =
       gst_segment_to_running_time (&decoder->input_segment, GST_FORMAT_TIME,
       frame->pts);
@@ -4010,6 +4097,17 @@ gst_video_decoder_decode_frame (GstVideoDecoder * decoder,
   ret = decoder_class->handle_frame (decoder, frame);
   if (ret != GST_FLOW_OK)
     GST_DEBUG_OBJECT (decoder, "flow error %s", gst_flow_get_name (ret));
+  if (g_queue_find (&priv->frames, frame) &&
+      GST_VIDEO_CODEC_FRAME_FLAG_IS_SET (frame,
+          GST_VIDEO_CODEC_FRAME_FLAG_XLNX_ALREADY_PUSHED)
+      && GST_BUFFER_FLAG_IS_SET (frame->input_buffer,
+          GST_BUFFER_FLAG_MARKER)) {
+    /* Release it if it's already been pushed */
+    GST_DEBUG_OBJECT (decoder, "Release already pushed frame %d with marker",
+        frame->system_frame_number);
+    gst_video_codec_frame_ref (frame);
+    gst_video_decoder_release_frame (decoder, frame);
+  }
 
   /* the frame has either been added to parse_gather or sent to
      handle frame so there is no need to unref it */
@@ -4468,6 +4566,14 @@ gst_video_decoder_negotiate_default (GstVideoDecoder * decoder)
             "content-light-level", G_TYPE_STRING, s, NULL);
       }
     }
+    if (gst_structure_has_field (in_struct, "hdr-format")) {
+      const gchar *s;
+      state->caps = gst_caps_make_writable (state->caps);
+
+      if ((s = gst_structure_get_string (in_struct, "hdr-format"))) {
+        gst_caps_set_simple (state->caps, "hdr-format", G_TYPE_STRING, s, NULL);
+      }
+    }
 
     gst_caps_unref (incaps);
   }
@@ -4476,6 +4582,24 @@ gst_video_decoder_negotiate_default (GstVideoDecoder * decoder)
     state->allocation_caps = gst_caps_ref (state->caps);
 
   GST_DEBUG_OBJECT (decoder, "setting caps %" GST_PTR_FORMAT, state->caps);
+
+  {
+    GstCapsFeatures *features;
+
+    features = gst_caps_get_features (state->caps, 0);
+    if (features
+        && gst_caps_features_contains (features,
+            GST_CAPS_FEATURE_MEMORY_XLNX_LL)) {
+      if (decoder->input_segment.rate > 0.0) {
+        GST_DEBUG_OBJECT (decoder, "decoder is using XLNX-LL");
+        decoder->priv->xlnx_ll = TRUE;
+      } else {
+        GST_DEBUG_OBJECT (decoder,
+            "XLNX-LL caps set but doing reverse playback. Disable XLNX-LL mode");
+        decoder->priv->xlnx_ll = FALSE;
+      }
+    }
+  }
 
   /* Push all pending pre-caps events of the oldest frame before
    * setting caps */
@@ -5002,7 +5126,7 @@ gst_video_decoder_set_subframe_mode (GstVideoDecoder * decoder,
 gboolean
 gst_video_decoder_get_subframe_mode (GstVideoDecoder * decoder)
 {
-  return decoder->priv->subframe_mode;
+  return decoder->priv->subframe_mode && decoder->input_segment.rate > 0.0;
 }
 
 /**

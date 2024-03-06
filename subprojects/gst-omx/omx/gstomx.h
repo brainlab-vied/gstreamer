@@ -228,6 +228,9 @@ typedef enum {
   GST_OMX_ACQUIRE_BUFFER_ERROR,
   /* No buffer is currently available (used when calling gst_omx_port_acquire_buffer() in not waiting mode) */
   GST_OMX_ACQUIRE_BUFFER_NO_AVAILABLE,
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
+  GST_OMX_ACQUIRE_BUFFER_RESOLUTION_CHANGE,
+#endif
 } GstOMXAcquireBufferReturn;
 
 struct _GstOMXCore {
@@ -243,7 +246,11 @@ struct _GstOMXCore {
   OMX_ERRORTYPE (*init) (void);
   OMX_ERRORTYPE (*deinit) (void);
   OMX_ERRORTYPE (*get_handle) (OMX_HANDLETYPE * handle,
+#if defined(USE_OMX_TARGET_VERSAL)
+      OMX_STRING name, OMX_PTR data, OMX_CALLBACKTYPE * callbacks, OMX_ALG_COREINDEXTYPE nCoreParamIndex, OMX_PTR pSettings);
+#else
       OMX_STRING name, OMX_PTR data, OMX_CALLBACKTYPE * callbacks);
+#endif
   OMX_ERRORTYPE (*free_handle) (OMX_HANDLETYPE handle);
   OMX_ERRORTYPE (*setup_tunnel) (OMX_HANDLETYPE output, OMX_U32 outport, OMX_HANDLETYPE input, OMX_U32 inport);
 };
@@ -256,6 +263,10 @@ typedef enum {
   GST_OMX_MESSAGE_PORT_SETTINGS_CHANGED,
   GST_OMX_MESSAGE_BUFFER_FLAG,
   GST_OMX_MESSAGE_BUFFER_DONE,
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
+  GST_OMX_MESSAGE_SEI_PARSED,
+  GST_OMX_MESSAGE_ALG_RESOLUTION_CHANGED,
+#endif
 } GstOMXMessageType;
 
 typedef enum {
@@ -306,6 +317,14 @@ struct _GstOMXMessage {
       OMX_BUFFERHEADERTYPE *buffer;
       OMX_BOOL empty;
     } buffer_done;
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
+    struct {
+      gboolean prefix;
+      OMX_U32 payload_type;
+      OMX_U32 payload_size;
+      gpointer payload;
+    } sei_parsed;
+#endif
   } content;
 };
 
@@ -332,6 +351,17 @@ struct _GstOMXPort {
    */
   gint settings_cookie;
   gint configured_settings_cookie;
+
+  /* The previous port definition. This is set when handling
+   * EventPortSettingsChanged callback from OMX so elements can check
+   * what actually changed in the port definition. */
+  OMX_PARAM_PORTDEFINITIONTYPE old_port_def;
+
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
+  /* If TRUE, OMX notified a resolution change which should be resolved
+   * before handling the next upcoming buffer. */
+  gboolean resolution_changed;
+#endif
 };
 
 struct _GstOMXComponent {
@@ -367,6 +397,7 @@ struct _GstOMXComponent {
   OMX_ERRORTYPE last_error;
 
   GList *pending_reconfigure_outports;
+  GQueue pending_downstream_events; /* contains owned GstOMXPendingEvent */
 };
 
 struct _GstOMXBuffer {
@@ -442,6 +473,8 @@ OMX_ERRORTYPE     gst_omx_component_set_parameter (GstOMXComponent * comp, OMX_I
 OMX_ERRORTYPE     gst_omx_component_get_config (GstOMXComponent * comp, OMX_INDEXTYPE index, gpointer config);
 OMX_ERRORTYPE     gst_omx_component_set_config (GstOMXComponent * comp, OMX_INDEXTYPE index, gpointer config);
 
+GstEvent *        gst_omx_component_pop_pending_downstream_event (GstOMXComponent * comp, GstOMXBuffer * preceding_buffer);
+
 OMX_ERRORTYPE     gst_omx_setup_tunnel (GstOMXPort * port1, GstOMXPort * port2);
 OMX_ERRORTYPE     gst_omx_close_tunnel (GstOMXPort * port1, GstOMXPort * port2);
 
@@ -451,6 +484,7 @@ OMX_ERRORTYPE     gst_omx_port_update_port_definition (GstOMXPort *port, OMX_PAR
 
 GstOMXAcquireBufferReturn gst_omx_port_acquire_buffer (GstOMXPort *port, GstOMXBuffer **buf, GstOMXWait wait);
 OMX_ERRORTYPE     gst_omx_port_release_buffer (GstOMXPort *port, GstOMXBuffer *buf);
+gint              gst_omx_port_find_buffer_idx (GstOMXPort *port, GstOMXBuffer *buf);
 
 OMX_ERRORTYPE     gst_omx_port_set_flushing (GstOMXPort *port, GstClockTime timeout, gboolean flush);
 gboolean          gst_omx_port_is_flushing (GstOMXPort *port);

@@ -56,6 +56,7 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
+#include <drm_mode.h>
 #include <string.h>
 
 #include "gstkmssink.h"
@@ -70,15 +71,48 @@
 
 #define GST_PLUGIN_NAME "kmssink"
 #define GST_PLUGIN_DESC "Video sink using the Linux kernel mode setting API"
+#define OMX_ALG_GST_EVENT_INSERT_PREFIX_SEI "omx-alg/sei-parsed"
+#define VSYNC_GAP_USEC 2500
+
+#ifndef DRM_MODE_FB_ALTERNATE_TOP
+#  define DRM_MODE_FB_ALTERNATE_TOP       (1<<2)        /* for alternate top field */
+#endif
+#ifndef DRM_MODE_FB_ALTERNATE_BOTTOM
+#  define DRM_MODE_FB_ALTERNATE_BOTTOM    (1<<3)        /* for alternate bottom field */
+#endif
+
+#define LUMA_PLANE                        0
+#define CHROMA_PLANE                      1
+#define ROI_RECT_THICKNESS_MIN            0
+#define ROI_RECT_THICKNESS_MAX            5
+#define ROI_RECT_COLOR_MIN                0
+#define ROI_RECT_COLOR_MAX                255
+
+#define GRAY_HEIGHT_MAX                   6480
+#ifndef DRM_FORMAT_Y8
+#define DRM_FORMAT_Y8		fourcc_code('G', 'R', 'E', 'Y') /* 8  Greyscale */
+#endif
+#ifndef DRM_FORMAT_Y10
+#define DRM_FORMAT_Y10		fourcc_code('Y', '1', '0', ' ') /* 10 Greyscale */
+#endif
+#ifndef DRM_FORMAT_X403
+#define DRM_FORMAT_X403		fourcc_code('X', '4', '0', '3') /* non-subsampled Cb:Cr plane 2:10:10:10 */
+#endif
+
 
 GST_DEBUG_CATEGORY_STATIC (gst_kms_sink_debug);
 GST_DEBUG_CATEGORY_STATIC (CAT_PERFORMANCE);
 #define GST_CAT_DEFAULT gst_kms_sink_debug
 
+/* sink is zynqmp DisplayPort */
+gboolean is_dp = FALSE;
+
 static GstFlowReturn gst_kms_sink_show_frame (GstVideoSink * vsink,
     GstBuffer * buf);
 static void gst_kms_sink_video_overlay_init (GstVideoOverlayInterface * iface);
 static void gst_kms_sink_drain (GstKMSSink * self);
+static void ensure_kms_allocator (GstKMSSink * self);
+static gboolean gst_kms_sink_sink_event (GstBaseSink * bsink, GstEvent * event);
 
 #define parent_class gst_kms_sink_parent_class
 G_DEFINE_TYPE_WITH_CODE (GstKMSSink, gst_kms_sink, GST_TYPE_VIDEO_SINK,
@@ -101,12 +135,37 @@ enum
   PROP_CAN_SCALE,
   PROP_DISPLAY_WIDTH,
   PROP_DISPLAY_HEIGHT,
+  PROP_HOLD_EXTRA_SAMPLE,
+  PROP_DO_TIMESTAMP,
+  PROP_AVOID_FIELD_INVERSION,
+  PROP_ADJUST_LATENCY,
+  PROP_LIMIT_ERROR_RECOVERY,
   PROP_CONNECTOR_PROPS,
   PROP_PLANE_PROPS,
+  PROP_FULLSCREEN_OVERLAY,
+  PROP_FORCE_NTSC_TV,
+  PROP_GRAY_TO_YUV444,
+  PROP_DRAW_ROI,
+  PROP_ROI_RECT_THICKNESS,
+  PROP_ROI_RECT_COLOR,
   PROP_FD,
   PROP_SKIP_VSYNC,
   PROP_N,
 };
+
+enum
+{
+  DRM_STATIC_METADATA_TYPE1 = 1,
+};
+
+enum
+{
+  DRM_EOTF_TRADITIONAL_GAMMA_SDR,
+  DRM_EOTF_TRADITIONAL_GAMMA_HDR,
+  DRM_EOTF_SMPTE_ST2084,
+  DRM_EOTF_BT_2100_HLG,
+};
+
 
 static GParamSpec *g_properties[PROP_N] = { NULL, };
 
@@ -499,12 +558,60 @@ kms_open (gchar ** driver)
   return fd;
 }
 
+static guint64
+find_property_value_for_plane_id (gint fd, gint plane_id, const char *prop_name)
+{
+  drmModeObjectPropertiesPtr properties;
+  drmModePropertyPtr property;
+  gint i, prop_value;
+
+  properties = drmModeObjectGetProperties (fd, plane_id, DRM_MODE_OBJECT_PLANE);
+
+  for (i = 0; i < properties->count_props; i++) {
+    property = drmModeGetProperty (fd, properties->props[i]);
+    if (!strcmp (property->name, prop_name)) {
+      prop_value = properties->prop_values[i];
+      drmModeFreeProperty (property);
+      drmModeFreeObjectProperties (properties);
+      return prop_value;
+    }
+  }
+
+  return -1;
+
+}
+
+static gboolean
+set_property_value_for_plane_id (gint fd, gint plane_id, const char *prop_name,
+    gint value)
+{
+  drmModeObjectPropertiesPtr properties;
+  drmModePropertyPtr property;
+  gint i;
+  gboolean ret = FALSE;
+
+  properties = drmModeObjectGetProperties (fd, plane_id, DRM_MODE_OBJECT_PLANE);
+
+  for (i = 0; i < properties->count_props && !ret; i++) {
+    property = drmModeGetProperty (fd, properties->props[i]);
+    if (!strcmp (property->name, prop_name)) {
+      drmModeObjectSetProperty (fd, plane_id,
+          DRM_MODE_OBJECT_PLANE, property->prop_id, value);
+      ret = TRUE;
+    }
+    drmModeFreeProperty (property);
+  }
+
+  drmModeFreeObjectProperties (properties);
+  return ret;
+}
+
 static drmModePlane *
 find_plane_for_crtc (int fd, drmModeRes * res, drmModePlaneRes * pres,
-    int crtc_id)
+    int crtc_id, int plane_type)
 {
   drmModePlane *plane;
-  int i, pipe;
+  int i, pipe, value;
 
   plane = NULL;
   pipe = -1;
@@ -520,6 +627,11 @@ find_plane_for_crtc (int fd, drmModeRes * res, drmModePlaneRes * pres,
 
   for (i = 0; i < pres->count_planes; i++) {
     plane = drmModeGetPlane (fd, pres->planes[i]);
+    if (plane_type != -1) {
+      value = find_property_value_for_plane_id (fd, pres->planes[i], "type");
+      if (plane_type != value)
+        continue;
+    }
     if (plane->possible_crtcs & (1 << pipe))
       return plane;
     drmModeFreePlane (plane);
@@ -737,14 +849,19 @@ configure_mode_setting (GstKMSSink * self, GstVideoInfo * vinfo)
   drmModeConnector *conn;
   int err;
   gint i;
-  drmModeModeInfo *mode;
+  drmModeModeInfo *mode = NULL;
+  drmModeModeInfo *cached_mode = NULL;
   guint32 fb_id;
-  GstKMSMemory *kmsmem;
-
+  GstMemory *mem = 0;
+  gfloat fps;
+  gfloat vrefresh;
   ret = FALSE;
   conn = NULL;
   mode = NULL;
-  kmsmem = NULL;
+
+  if (self->vinfo_crtc.finfo
+      && gst_video_info_is_equal (&self->vinfo_crtc, vinfo))
+    return TRUE;
 
   if (self->conn_id < 0)
     goto bail;
@@ -752,38 +869,84 @@ configure_mode_setting (GstKMSSink * self, GstVideoInfo * vinfo)
   GST_INFO_OBJECT (self, "configuring mode setting");
 
   ensure_kms_allocator (self);
-  kmsmem = (GstKMSMemory *) gst_kms_allocator_bo_alloc (self->allocator, vinfo);
-  if (!kmsmem)
+  mem = gst_kms_allocator_bo_alloc (self->allocator, vinfo);
+  if (!mem)
     goto bo_failed;
-  fb_id = kmsmem->fb_id;
+
+  if (!gst_kms_memory_add_fb (mem, vinfo, 0))
+    goto bo_failed;
+
+  fb_id = gst_kms_memory_get_fb_id (mem);
 
   conn = drmModeGetConnector (self->fd, self->conn_id);
   if (!conn)
     goto connector_failed;
 
+  fps = (gfloat) GST_VIDEO_INFO_FPS_N (vinfo) / GST_VIDEO_INFO_FPS_D (vinfo);
+
+  if (self->force_ntsc_tv && vinfo->height == 480) {
+    vinfo->height = 486;
+    vinfo->width = 720;
+    GST_LOG_OBJECT (self, "Forcing mode setting to NTSC TV D1(720x486i)");
+  }
+
   for (i = 0; i < conn->count_modes; i++) {
-    if (conn->modes[i].vdisplay == GST_VIDEO_INFO_HEIGHT (vinfo) &&
+    if (conn->modes[i].vdisplay == GST_VIDEO_INFO_FIELD_HEIGHT (vinfo) &&
         conn->modes[i].hdisplay == GST_VIDEO_INFO_WIDTH (vinfo)) {
+      vrefresh = conn->modes[i].clock * 1000.00 /
+          (conn->modes[i].htotal * conn->modes[i].vtotal);
+      if (GST_VIDEO_INFO_INTERLACE_MODE (vinfo) ==
+          GST_VIDEO_INTERLACE_MODE_ALTERNATE) {
+
+        if (!(conn->modes[i].flags & DRM_MODE_FLAG_INTERLACE))
+          continue;
+
+        if (ABS (vrefresh - fps) > 0.005)
+          continue;
+      } else if (ABS (vrefresh - fps) > 0.005) {
+        cached_mode = &conn->modes[i];
+        continue;
+      }
       mode = &conn->modes[i];
       break;
     }
   }
-  if (!mode)
-    goto mode_failed;
+  if (!mode) {
+    if (cached_mode)
+      mode = cached_mode;
+    else
+      goto mode_failed;
+  }
 
   err = drmModeSetCrtc (self->fd, self->crtc_id, fb_id, 0, 0,
       (uint32_t *) & self->conn_id, 1, mode);
+
+/* Since at the moment force-modesetting doesn't support scaling */
+  GST_OBJECT_LOCK (self);
+  self->hdisplay = mode->hdisplay;
+  self->vdisplay = mode->vdisplay;
+  self->render_rect.x = 0;
+  self->render_rect.y = 0;
+  self->render_rect.w = self->hdisplay;
+  self->render_rect.h = self->vdisplay;
+  self->buffer_id = fb_id;
+  GST_OBJECT_UNLOCK (self);
+
   if (err)
     goto modesetting_failed;
 
   g_clear_pointer (&self->tmp_kmsmem, gst_memory_unref);
-  self->tmp_kmsmem = (GstMemory *) kmsmem;
+  self->tmp_kmsmem = mem;
+  mem = NULL;
+  self->vinfo_crtc = *vinfo;
 
   ret = TRUE;
 
 bail:
   if (conn)
     drmModeFreeConnector (conn);
+  if (mem)
+    gst_memory_unref (mem);
 
   return ret;
 
@@ -809,6 +972,55 @@ modesetting_failed:
     GST_ERROR_OBJECT (self, "Failed to set mode: %s", g_strerror (errno));
     goto bail;
   }
+}
+
+static gboolean
+set_crtc_to_plane_size (GstKMSSink * self, GstVideoInfo * vinfo)
+{
+  const gchar *format;
+  gint j;
+  GstVideoFormat fmt;
+  gboolean ret = FALSE;
+  GstVideoInfo vinfo_crtc;
+  drmModePlane *primary_plane;
+
+  if (self->primary_plane_id != -1)
+    primary_plane = drmModeGetPlane (self->fd, self->primary_plane_id);
+  if (!primary_plane)
+    return ret;
+
+  if (self->primary_plane_id != -1)
+    ret =
+        set_property_value_for_plane_id (self->fd, self->primary_plane_id,
+        "alpha", 0);
+  if (!ret)
+    GST_ERROR_OBJECT (self, "Unable to reset alpha value of base plane");
+
+  for (j = 0; j < primary_plane->count_formats; j++) {
+    fmt = gst_video_format_from_drm (primary_plane->formats[j]);
+    if (fmt == GST_VIDEO_FORMAT_UNKNOWN) {
+      GST_INFO_OBJECT (self, "ignoring format %" GST_FOURCC_FORMAT,
+          GST_FOURCC_ARGS (primary_plane->formats[j]));
+      continue;
+    } else {
+      break;
+    }
+  }
+  if (primary_plane)
+    drmModeFreePlane (primary_plane);
+
+  gst_video_info_set_interlaced_format (&vinfo_crtc, fmt,
+      GST_VIDEO_INFO_INTERLACE_MODE (vinfo), vinfo->width, vinfo->height);
+  GST_VIDEO_INFO_FPS_N (&vinfo_crtc) = GST_VIDEO_INFO_FPS_N (vinfo);
+  GST_VIDEO_INFO_FPS_D (&vinfo_crtc) = GST_VIDEO_INFO_FPS_D (vinfo);
+  format = gst_video_format_to_string (vinfo_crtc.finfo->format);
+
+  GST_DEBUG_OBJECT (self,
+      "Format for modesetting = %s, width = %d and height = %d", format,
+      vinfo->width, vinfo->height);
+  ret = configure_mode_setting (self, &vinfo_crtc);
+
+  return ret;
 }
 
 static gboolean
@@ -844,6 +1056,12 @@ ensure_allowed_caps (GstKMSSink * self, drmModeConnector * conn,
       mode = &conn->modes[i];
 
     for (j = 0; j < plane->count_formats; j++) {
+      if (self->gray_to_yuv444) {
+        if (plane->formats[j] == DRM_FORMAT_YUV444)
+          plane->formats[j] = DRM_FORMAT_Y8;
+        if (plane->formats[j] == DRM_FORMAT_X403)
+          plane->formats[j] = DRM_FORMAT_Y10;
+      }
       fmt = gst_video_format_from_drm (plane->formats[j]);
       if (fmt == GST_VIDEO_FORMAT_UNKNOWN) {
         GST_INFO_OBJECT (self, "ignoring format %" GST_FOURCC_FORMAT,
@@ -854,17 +1072,47 @@ ensure_allowed_caps (GstKMSSink * self, drmModeConnector * conn,
       format = gst_video_format_to_string (fmt);
 
       if (mode) {
+        gboolean interlaced;
+        gint height;
+
+        height = mode->vdisplay;
+        interlaced = (conn->modes[i].flags & DRM_MODE_FLAG_INTERLACE);
+
+        if (interlaced)
+          /* Expose the frame height in caps, not the field */
+          height *= 2;
+
+        if (self->gray_to_yuv444)
+          height = 3 * height;
+
         caps = gst_caps_new_simple ("video/x-raw",
             "format", G_TYPE_STRING, format,
             "width", G_TYPE_INT, mode->hdisplay,
-            "height", G_TYPE_INT, mode->vdisplay,
+            "height", G_TYPE_INT, height,
             "framerate", GST_TYPE_FRACTION_RANGE, 0, 1, G_MAXINT, 1, NULL);
+
+        if (interlaced) {
+          GstCapsFeatures *feat;
+
+          feat =
+              gst_caps_features_new (GST_CAPS_FEATURE_FORMAT_INTERLACED, NULL);
+          gst_caps_set_features (caps, 0, feat);
+        }
       } else {
-        caps = gst_caps_new_simple ("video/x-raw",
+        GstStructure *s;
+        GstCapsFeatures *feat;
+
+        s = gst_structure_new ("video/x-raw",
             "format", G_TYPE_STRING, format,
             "width", GST_TYPE_INT_RANGE, res->min_width, res->max_width,
             "height", GST_TYPE_INT_RANGE, res->min_height, res->max_height,
             "framerate", GST_TYPE_FRACTION_RANGE, 0, 1, G_MAXINT, 1, NULL);
+
+        /* FIXME: How could we check if res supports interlacing? */
+        caps = gst_caps_new_full (s, gst_structure_copy (s), NULL);
+
+        feat = gst_caps_features_new (GST_CAPS_FEATURE_FORMAT_INTERLACED, NULL);
+        gst_caps_set_features (caps, 1, feat);
       }
       if (!caps)
         continue;
@@ -880,6 +1128,8 @@ ensure_allowed_caps (GstKMSSink * self, drmModeConnector * conn,
     gst_caps_unref (out_caps);
     return FALSE;
   }
+
+  out_caps = gst_kms_add_xlnx_ll_caps (out_caps, TRUE);
 
   self->allowed_caps = gst_caps_simplify (out_caps);
 
@@ -1013,6 +1263,88 @@ gst_kms_sink_update_plane_properties (GstKMSSink * self)
   gst_kms_sink_update_properties (&iter, self->plane_props);
 }
 
+
+static void
+gst_kms_sink_get_times (GstBaseSink * bsink, GstBuffer * buffer,
+    GstClockTime * start, GstClockTime * end)
+{
+  GstKMSSink *self;
+  GstClockTime timestamp, duration;
+  GstClockTimeDiff vblank_diff = 0, vblank_drift = 0;
+  GstClockTimeDiff ts_diff = 0, ts_drift = 0;
+
+  self = GST_KMS_SINK (bsink);
+  timestamp = GST_BUFFER_PTS (buffer);
+  if (GST_CLOCK_TIME_IS_VALID (timestamp))
+    *start = timestamp;
+  else
+    return;
+
+  if (self->last_ts == timestamp || !self->do_timestamp) {
+    GST_TRACE_OBJECT (self,
+        "self->last_ts: %" GST_TIME_FORMAT " self->do_timestamp %d",
+        GST_TIME_ARGS (self->last_ts), self->do_timestamp);
+    goto done;
+  }
+
+  GST_TRACE_OBJECT (self,
+      "original ts :%" GST_TIME_FORMAT " last_orig_ts :%" GST_TIME_FORMAT
+      " last_ts :%" GST_TIME_FORMAT, GST_TIME_ARGS (timestamp),
+      GST_TIME_ARGS (self->last_orig_ts), GST_TIME_ARGS (self->last_ts));
+
+  if (GST_CLOCK_TIME_IS_VALID (self->prev_last_vblank)
+      && GST_CLOCK_TIME_IS_VALID (self->last_ts)) {
+    vblank_diff = GST_CLOCK_DIFF (self->prev_last_vblank, self->last_vblank);
+    vblank_drift =
+        ABS (GST_CLOCK_DIFF (GST_BUFFER_DURATION (buffer), vblank_diff));
+    ts_diff = GST_CLOCK_DIFF (self->last_orig_ts, timestamp);
+    ts_drift = ABS (GST_CLOCK_DIFF (GST_BUFFER_DURATION (buffer), ts_diff));
+    GST_TRACE_OBJECT (self, "vblank_diff: %" GST_TIME_FORMAT
+        ", vblank_drift: %" GST_TIME_FORMAT ", ts_diff :%" GST_TIME_FORMAT
+        ", ts_drift %" GST_TIME_FORMAT, GST_TIME_ARGS (vblank_diff),
+        GST_TIME_ARGS (vblank_drift), GST_TIME_ARGS (ts_diff),
+        GST_TIME_ARGS (ts_drift));
+
+    if (ts_drift < 2 * GST_MSECOND && vblank_drift < 2 * GST_MSECOND) {
+      *start = self->last_ts + vblank_diff;
+      *end = *start + duration;
+      GST_DEBUG_OBJECT (self, "got start: %" GST_TIME_FORMAT
+          ", adjusted: %" GST_TIME_FORMAT ", delta %" GST_TIME_FORMAT,
+          GST_TIME_ARGS (timestamp), GST_TIME_ARGS (*start),
+          GST_TIME_ARGS ((GST_CLOCK_DIFF (timestamp, *start))));
+    } else {
+      if (ts_drift > 2 * GST_MSECOND) {
+        self->prev_last_vblank = GST_CLOCK_TIME_NONE;
+        self->last_vblank = GST_CLOCK_TIME_NONE;
+        GST_DEBUG_OBJECT (self, "Need resyncing as packet loss happen");
+      }
+      *start = self->last_ts + ts_diff;
+      *end = *start + duration;
+      GST_DEBUG_OBJECT (self, "got start: %" GST_TIME_FORMAT
+          ", gap found, adjusted : to %" GST_TIME_FORMAT " as per ts, delta %"
+          GST_TIME_FORMAT ", ts_diff %" GST_TIME_FORMAT "vblank_diff %"
+          GST_TIME_FORMAT ", ts_drift %" GST_TIME_FORMAT ", vsync_drift %"
+          GST_TIME_FORMAT, GST_TIME_ARGS (timestamp), GST_TIME_ARGS (*start),
+          GST_TIME_ARGS ((GST_CLOCK_DIFF (timestamp, *start))),
+          GST_TIME_ARGS (ts_diff), GST_TIME_ARGS (vblank_diff),
+          GST_TIME_ARGS (ts_drift), GST_TIME_ARGS (vblank_drift));
+    }
+  }
+
+  GST_BUFFER_PTS (buffer) = *start;
+
+  self->last_orig_ts = timestamp;
+  self->last_ts = *start;
+done:
+  duration = GST_BUFFER_DURATION (buffer);
+  if (GST_CLOCK_TIME_IS_VALID (duration)) {
+    *end = *start + duration;
+  }
+  GST_LOG_OBJECT (self, "got times start: %" GST_TIME_FORMAT
+      ", stop: %" GST_TIME_FORMAT, GST_TIME_ARGS (*start),
+      GST_TIME_ARGS (*end));
+}
+
 static gboolean
 gst_kms_sink_start (GstBaseSink * bsink)
 {
@@ -1021,9 +1353,10 @@ gst_kms_sink_start (GstBaseSink * bsink)
   drmModeConnector *conn;
   drmModeCrtc *crtc;
   drmModePlaneRes *pres;
-  drmModePlane *plane;
+  drmModePlane *plane = NULL, *primary_plane = NULL;
   gboolean universal_planes;
   gboolean ret;
+  gint plane_type = -1;
 
   self = GST_KMS_SINK (bsink);
   universal_planes = FALSE;
@@ -1033,6 +1366,10 @@ gst_kms_sink_start (GstBaseSink * bsink)
   crtc = NULL;
   pres = NULL;
   plane = NULL;
+
+  self->xlnx_ll = FALSE;
+  self->primary_plane_id = -1;
+  self->error_correction_margin = 0;
 
   /* open our own internal device fd if application did not supply its own */
   if (self->is_internal_fd) {
@@ -1061,10 +1398,12 @@ gst_kms_sink_start (GstBaseSink * bsink)
     goto connector_failed;
 
   crtc = find_crtc_for_connector (self->fd, res, conn, &self->pipe);
+
   if (!crtc)
     goto crtc_failed;
 
-  if (!crtc->mode_valid || self->modesetting_enabled) {
+  if ((!crtc->mode_valid || self->modesetting_enabled)
+      && !self->fullscreen_enabled) {
     GST_DEBUG_OBJECT (self, "enabling modesetting");
     self->modesetting_enabled = TRUE;
     universal_planes = TRUE;
@@ -1072,6 +1411,11 @@ gst_kms_sink_start (GstBaseSink * bsink)
 
   if (crtc->mode_valid && self->modesetting_enabled && self->restore_crtc) {
     self->saved_crtc = (drmModeCrtc *) crtc;
+  }
+
+  if (self->fullscreen_enabled) {
+    universal_planes = TRUE;
+    plane_type = DRM_PLANE_TYPE_OVERLAY;
   }
 
 retry_find_plane:
@@ -1084,11 +1428,24 @@ retry_find_plane:
     goto plane_resources_failed;
 
   if (self->plane_id == -1)
-    plane = find_plane_for_crtc (self->fd, res, pres, crtc->crtc_id);
+    plane =
+        find_plane_for_crtc (self->fd, res, pres, crtc->crtc_id, plane_type);
   else
     plane = drmModeGetPlane (self->fd, self->plane_id);
+
   if (!plane)
     goto plane_failed;
+
+  primary_plane =
+      find_plane_for_crtc (self->fd, res, pres, crtc->crtc_id,
+      DRM_PLANE_TYPE_PRIMARY);
+  if (!primary_plane && self->fullscreen_enabled)
+    goto primary_plane_failed;
+  if (primary_plane)
+    self->primary_plane_id = primary_plane->plane_id;
+
+  if (self->fullscreen_enabled == 1)
+    self->saved_crtc = (drmModeCrtc *) crtc;
 
   if (!ensure_allowed_caps (self, conn, plane, res))
     goto allowed_caps_failed;
@@ -1116,6 +1473,20 @@ retry_find_plane:
 
   self->buffer_id = crtc->buffer_id;
 
+  if (self->avoid_field_inversion) {
+    self->hold_extra_sample = TRUE;
+    GST_DEBUG_OBJECT (self, "Avoid field inversion and hold extra sample set");
+  }
+
+  if (self->primary_plane_id != -1) {
+    if (find_property_value_for_plane_id (self->fd,
+            self->primary_plane_id, "fid_err") != -1) {
+      self->fix_field_inversion = TRUE;
+      self->hold_extra_sample = TRUE;
+      GST_DEBUG_OBJECT (self, "Fix field inversion and hold extra sample set");
+    }
+  }
+ 
   self->mm_width = conn->mmWidth;
   self->mm_height = conn->mmHeight;
 
@@ -1129,17 +1500,16 @@ retry_find_plane:
   g_object_notify_by_pspec (G_OBJECT (self), g_properties[PROP_DISPLAY_WIDTH]);
   g_object_notify_by_pspec (G_OBJECT (self), g_properties[PROP_DISPLAY_HEIGHT]);
 
-  gst_kms_sink_update_connector_properties (self);
-  gst_kms_sink_update_plane_properties (self);
-
   ret = TRUE;
 
 bail:
   if (plane)
     drmModeFreePlane (plane);
+  if (primary_plane)
+    drmModeFreePlane (primary_plane);
   if (pres)
     drmModeFreePlaneResources (pres);
-  if (crtc != self->saved_crtc)
+  if (crtc != self->saved_crtc && !self->fullscreen_enabled)
     drmModeFreeCrtc (crtc);
   if (conn)
     drmModeFreeConnector (conn);
@@ -1212,6 +1582,13 @@ plane_failed:
     }
   }
 
+primary_plane_failed:
+  {
+    GST_ELEMENT_ERROR (self, RESOURCE, SETTINGS,
+        ("Could not find primary plane for crtc"), (NULL));
+    goto bail;
+  }
+
 allowed_caps_failed:
   {
     GST_ELEMENT_ERROR (self, RESOURCE, SETTINGS,
@@ -1232,7 +1609,16 @@ gst_kms_sink_stop (GstBaseSink * bsink)
   if (self->allocator)
     gst_kms_allocator_clear_cache (self->allocator);
 
+  if (self->fullscreen_enabled && self->primary_plane_id != -1) {
+    err = set_property_value_for_plane_id (self->fd, self->primary_plane_id,
+        "alpha", 255);
+    if (!err)
+      GST_ERROR_OBJECT (self, "Unable to reset alpha value of primary plane");
+  }
+
   gst_buffer_replace (&self->last_buffer, NULL);
+  if (self->hold_extra_sample)
+    gst_buffer_replace (&self->previous_last_buffer, NULL);
   gst_caps_replace (&self->allowed_caps, NULL);
   gst_object_replace ((GstObject **) & self->pool, NULL);
   gst_object_replace ((GstObject **) & self->allocator, NULL);
@@ -1240,6 +1626,9 @@ gst_kms_sink_stop (GstBaseSink * bsink)
   gst_poll_remove_fd (self->poll, &self->pollfd);
   gst_poll_restart (self->poll);
   gst_poll_fd_init (&self->pollfd);
+
+
+  g_clear_pointer (&self->tmp_kmsmem, gst_memory_unref);
 
   if (self->saved_crtc) {
     drmModeCrtc *crtc = (drmModeCrtc *) self->saved_crtc;
@@ -1268,6 +1657,7 @@ gst_kms_sink_stop (GstBaseSink * bsink)
   self->pending_rect.w = 0;
   self->pending_rect.h = 0;
   self->render_rect = self->pending_rect;
+  self->primary_plane_id = -1;
   GST_OBJECT_UNLOCK (bsink);
 
   g_object_notify_by_pspec (G_OBJECT (self), g_properties[PROP_DISPLAY_WIDTH]);
@@ -1300,6 +1690,32 @@ gst_kms_sink_get_caps (GstBaseSink * bsink, GstCaps * filter)
 
   GST_OBJECT_LOCK (self);
 
+  if (self->gray_to_yuv444) {
+    int i;
+    gint min, max;
+    GValue *h = { 0, };
+
+    out_caps = gst_caps_new_empty ();
+
+    for (i = 0; i < gst_caps_get_size (caps); i++) {
+      s = gst_structure_copy (gst_caps_get_structure (caps, i));
+      h = gst_structure_get_value (s, "height");
+      if (GST_VALUE_HOLDS_INT_RANGE (h)) {
+        min = gst_value_get_int_range_min (h);
+        max = gst_value_get_int_range_max (h);
+        if (max < GRAY_HEIGHT_MAX)
+          max = GRAY_HEIGHT_MAX;
+        gst_structure_set (s, "height", GST_TYPE_INT_RANGE, min, max, NULL);
+      } else {
+        gst_structure_set (s, "height", G_TYPE_INT, GRAY_HEIGHT_MAX, NULL);
+      }
+      gst_caps_append_structure (out_caps, s);
+    }
+
+    out_caps = gst_caps_merge (out_caps, caps);
+    caps = out_caps;
+  }
+
   if (!self->can_scale) {
     out_caps = gst_caps_new_empty ();
     gst_video_calculate_device_ratio (self->hdisplay, self->vdisplay,
@@ -1307,17 +1723,13 @@ gst_kms_sink_get_caps (GstBaseSink * bsink, GstCaps * filter)
 
     s = gst_structure_copy (gst_caps_get_structure (caps, 0));
     gst_structure_set (s, "width", G_TYPE_INT, self->pending_rect.w,
-        "height", G_TYPE_INT, self->pending_rect.h,
-        "pixel-aspect-ratio", GST_TYPE_FRACTION, dpy_par_n, dpy_par_d, NULL);
+        "height", G_TYPE_INT, self->pending_rect.h, NULL);
 
     gst_caps_append_structure (out_caps, s);
 
     out_caps = gst_caps_merge (out_caps, caps);
     caps = NULL;
 
-    /* enforce our display aspect ratio */
-    gst_caps_set_simple (out_caps, "pixel-aspect-ratio", GST_TYPE_FRACTION,
-        dpy_par_n, dpy_par_d, NULL);
   } else {
     out_caps = gst_caps_make_writable (caps);
     caps = NULL;
@@ -1432,16 +1844,148 @@ out:
   return TRUE;
 }
 
+static gint
+gst_kms_sink_hdr_set_metadata (GstKMSSink * self, GstCaps * caps, guint32 * id)
+{
+#ifdef HAVE_HDR_OUTPUT_METADATA
+  gint ret = 0;
+  GstVideoMasteringDisplayInfo minfo;
+  GstVideoContentLightLevel cinfo;
+  struct hdr_metadata_infoframe *hdr_infoframe;
+#ifdef HAVE_GEN_HDR_OUTPUT_METADATA
+  struct gen_hdr_output_metadata hdr_metadata = { 0 };
+  const char prop_name[] = "GEN_HDR_OUTPUT_METADATA";
+  hdr_infoframe = (struct hdr_metadata_infoframe *) hdr_metadata.payload;
+#else
+  const char prop_name[] = "HDR_OUTPUT_METADATA";
+  hdr_infoframe = g_new (struct hdr_metadata_infoframe, 1);
+#endif
+
+  gst_video_mastering_display_info_init (&minfo);
+  gst_video_content_light_level_init (&cinfo);
+
+  if (gst_video_colorimetry_matches (&self->vinfo.colorimetry,
+          GST_VIDEO_COLORIMETRY_BT2100_PQ)
+      || gst_video_colorimetry_matches (&self->vinfo.colorimetry,
+          GST_VIDEO_COLORIMETRY_BT2100_HLG)) {
+    int i;
+
+#ifdef HAVE_GEN_HDR_OUTPUT_METADATA
+    hdr_metadata.metadata_type = DRM_HDR_TYPE_HDR10;
+    hdr_metadata.size = sizeof (struct hdr_metadata_infoframe);
+#endif
+    hdr_infoframe->metadata_type = DRM_STATIC_METADATA_TYPE1;
+    if (gst_video_colorimetry_matches (&self->vinfo.colorimetry,
+            GST_VIDEO_COLORIMETRY_BT2100_PQ))
+      hdr_infoframe->eotf = DRM_EOTF_SMPTE_ST2084;
+    else
+      hdr_infoframe->eotf = DRM_EOTF_BT_2100_HLG;
+
+    GST_LOG_OBJECT (self, "Setting EOTF to: %u", hdr_infoframe->eotf);
+
+    if (gst_video_mastering_display_info_from_caps (&minfo, caps)) {
+      for (i = 0; i < 3; i++) {
+        hdr_infoframe->display_primaries[i].x = minfo.display_primaries[i].x;
+        hdr_infoframe->display_primaries[i].y = minfo.display_primaries[i].y;
+      }
+
+      hdr_infoframe->white_point.x = minfo.white_point.x;
+      hdr_infoframe->white_point.y = minfo.white_point.y;
+      /* CTA 861.G is 1 candelas per square metre (cd/m^2) while
+       * GstVideoMasteringDisplayInfo is 0.0001 cd/m^2 */
+      hdr_infoframe->max_display_mastering_luminance =
+          minfo.max_display_mastering_luminance / 10000;
+      hdr_infoframe->min_display_mastering_luminance =
+          minfo.min_display_mastering_luminance;
+      GST_LOG_OBJECT (self, "Setting mastering display info: "
+          "Red(%u, %u) "
+          "Green(%u, %u) "
+          "Blue(%u, %u) "
+          "White(%u, %u) "
+          "max_luminance(%u) "
+          "min_luminance(%u) ",
+          minfo.display_primaries[0].x,
+          minfo.display_primaries[0].y,
+          minfo.display_primaries[1].x,
+          minfo.display_primaries[1].y,
+          minfo.display_primaries[2].x,
+          minfo.display_primaries[2].y, minfo.white_point.x,
+          minfo.white_point.y,
+          minfo.max_display_mastering_luminance,
+          minfo.min_display_mastering_luminance);
+    }
+
+    if (gst_video_content_light_level_from_caps (&cinfo, caps)) {
+      hdr_infoframe->max_cll = cinfo.max_content_light_level;
+      hdr_infoframe->max_fall = cinfo.max_frame_average_light_level;
+      GST_LOG_OBJECT (self, "Setting content light level: "
+          "maxCLL:(%u), maxFALL:(%u)",
+          cinfo.max_content_light_level, cinfo.max_frame_average_light_level);
+    }
+  }
+#ifdef HAVE_GEN_HDR_OUTPUT_METADATA
+  ret =
+      drmModeCreatePropertyBlob (self->fd, &hdr_metadata,
+      sizeof (struct gen_hdr_output_metadata), id);
+#else
+  ret =
+      drmModeCreatePropertyBlob (self->fd, hdr_infoframe,
+      sizeof (struct hdr_metadata_infoframe), id);
+#endif
+  if (ret) {
+    GST_WARNING_OBJECT (self, "drmModeCreatePropertyBlob failed: %s (%d)",
+        strerror (-ret), ret);
+  } else {
+    if (!self->connector_props)
+      self->connector_props =
+          gst_structure_new ("connector-props", prop_name,
+          G_TYPE_INT64, *id, NULL);
+    else
+      gst_structure_set (self->connector_props, prop_name,
+          G_TYPE_INT64, *id, NULL);
+  }
+
+#ifndef HAVE_GEN_HDR_OUTPUT_METADATA
+  g_free (hdr_infoframe);
+#endif
+
+  return ret;
+#endif /* HAVE_HDR_OUTPUT_METADATA */
+}
+
 static gboolean
 gst_kms_sink_set_caps (GstBaseSink * bsink, GstCaps * caps)
 {
   GstKMSSink *self;
   GstVideoInfo vinfo;
+  gint fps_n, fps_d;
+  guint32 hdr_id;
+  gint ret = 0;
 
   self = GST_KMS_SINK (bsink);
 
   if (!gst_video_info_from_caps (&vinfo, caps))
     goto invalid_format;
+
+  if (self->gray_to_yuv444) {
+    fps_n = vinfo.fps_n;
+    fps_d = vinfo.fps_d;
+    if (vinfo.finfo->format == GST_VIDEO_FORMAT_GRAY8)
+      gst_video_info_set_format (&vinfo, GST_VIDEO_FORMAT_Y444, vinfo.width,
+          vinfo.height / 3);
+    else if (vinfo.finfo->format == GST_VIDEO_FORMAT_GRAY10_LE32)
+      gst_video_info_set_format (&vinfo, GST_VIDEO_FORMAT_Y444_10LE32,
+          vinfo.width, vinfo.height / 3);
+
+    vinfo.fps_n = fps_n;
+    vinfo.fps_d = fps_d;
+  }
+
+  /* on the first set_caps self->vinfo is not initialized, yet. */
+  if (self->vinfo.finfo->format != GST_VIDEO_FORMAT_UNKNOWN)
+    self->last_vinfo = self->vinfo;
+  else
+    self->last_vinfo = vinfo;
   self->vinfo = vinfo;
 
   if (!gst_kms_sink_calculate_display_ratio (self, &vinfo,
@@ -1465,12 +2009,48 @@ gst_kms_sink_set_caps (GstBaseSink * bsink, GstCaps * caps)
   if (self->modesetting_enabled && !configure_mode_setting (self, &vinfo))
     goto modesetting_failed;
 
+  if (self->fullscreen_enabled && !set_crtc_to_plane_size (self, &vinfo))
+    goto modesetting_failed;
+
+  if (!self->modesetting_enabled && !self->fullscreen_enabled &&
+      GST_VIDEO_INFO_INTERLACE_MODE (&vinfo) ==
+      GST_VIDEO_INTERLACE_MODE_ALTERNATE) {
+    GST_DEBUG_OBJECT (self,
+        "configure mode setting as input is in alternate interlacing mode");
+    if (!configure_mode_setting (self, &vinfo))
+      goto modesetting_failed;
+  }
+
   GST_OBJECT_LOCK (self);
   if (self->reconfigure) {
     self->reconfigure = FALSE;
     self->render_rect = self->pending_rect;
   }
   GST_OBJECT_UNLOCK (self);
+
+  {
+    GstCapsFeatures *features;
+
+    features = gst_caps_get_features (caps, 0);
+    if (features
+        && gst_caps_features_contains (features,
+            GST_CAPS_FEATURE_MEMORY_XLNX_LL)) {
+      GST_DEBUG_OBJECT (self, "Input uses XLNX-LowLatency");
+      self->xlnx_ll = TRUE;
+    }
+  }
+
+  ret = gst_kms_sink_hdr_set_metadata (self, caps, &hdr_id);
+
+  gst_kms_sink_update_connector_properties (self);
+  gst_kms_sink_update_plane_properties (self);
+
+  if (!ret) {
+    ret = drmModeDestroyPropertyBlob (self->fd, hdr_id);
+    if (ret)
+      GST_WARNING_OBJECT (self, "drmModeDestroyPropertyBlob failed: %s (%d)",
+          strerror (-ret), ret);
+  }
 
   GST_DEBUG_OBJECT (self, "negotiated caps = %" GST_PTR_FORMAT, caps);
 
@@ -1506,6 +2086,61 @@ modesetting_failed:
 
 }
 
+static guint
+get_padding_right (GstKMSSink * self, GstVideoInfo * info, guint pitch)
+{
+  guint padding_pixels = -1;
+  guint plane_stride = GST_VIDEO_INFO_PLANE_STRIDE (info, 0);
+  guint padding_bytes = pitch - plane_stride;
+
+  switch (GST_VIDEO_INFO_FORMAT (info)) {
+    case GST_VIDEO_FORMAT_NV12:
+      padding_pixels = padding_bytes;
+      break;
+    case GST_VIDEO_FORMAT_RGBx:
+    case GST_VIDEO_FORMAT_r210:
+    case GST_VIDEO_FORMAT_Y410:
+    case GST_VIDEO_FORMAT_BGRx:
+    case GST_VIDEO_FORMAT_BGRA:
+    case GST_VIDEO_FORMAT_RGBA:
+      padding_pixels = padding_bytes / 4;
+      break;
+    case GST_VIDEO_FORMAT_YUY2:
+    case GST_VIDEO_FORMAT_UYVY:
+      padding_pixels = padding_bytes / 2;
+      break;
+    case GST_VIDEO_FORMAT_NV16:
+      padding_pixels = padding_bytes;
+      break;
+    case GST_VIDEO_FORMAT_RGB:
+    case GST_VIDEO_FORMAT_v308:
+    case GST_VIDEO_FORMAT_BGR:
+      padding_pixels = padding_bytes / 3;
+      break;
+    case GST_VIDEO_FORMAT_I422_10LE:
+      padding_pixels = padding_bytes / 2;
+      break;
+    case GST_VIDEO_FORMAT_NV12_10LE32:
+      padding_pixels = (padding_bytes * 3) / 4;
+      break;
+    case GST_VIDEO_FORMAT_GRAY8:
+      padding_pixels = padding_bytes;
+      break;
+    case GST_VIDEO_FORMAT_GRAY10_LE32:
+      padding_pixels = (padding_bytes * 3) / 4;
+      break;
+    case GST_VIDEO_FORMAT_I420:
+      padding_pixels = padding_bytes;
+      break;
+    case GST_VIDEO_FORMAT_I420_10LE:
+      padding_pixels = padding_bytes / 2;
+      break;
+    default:
+      padding_pixels = -1;
+  }
+  return padding_pixels;
+}
+
 static gboolean
 gst_kms_sink_propose_allocation (GstBaseSink * bsink, GstQuery * query)
 {
@@ -1515,6 +2150,11 @@ gst_kms_sink_propose_allocation (GstBaseSink * bsink, GstQuery * query)
   GstVideoInfo vinfo;
   GstBufferPool *pool;
   gsize size;
+  gint ret, w, h, i;
+  struct drm_mode_create_dumb arg = { 0, };
+  guint32 fmt;
+  drmModeConnector *conn;
+  GstVideoAlignment align = { 0, };
 
   self = GST_KMS_SINK (bsink);
 
@@ -1526,7 +2166,44 @@ gst_kms_sink_propose_allocation (GstBaseSink * bsink, GstQuery * query)
   if (!gst_video_info_from_caps (&vinfo, caps))
     goto invalid_caps;
 
+  conn = drmModeGetConnector (self->fd, self->conn_id);
+  if (((self->devname ? !strcmp (self->devname, "xlnx") : 0)
+          && conn->connector_type == DRM_MODE_CONNECTOR_DisplayPort)
+      || (self->bus_id ? strstr (self->bus_id, "zynqmp-display") : 0)) {
+    is_dp = TRUE;
+    fmt = gst_drm_format_from_video (GST_VIDEO_INFO_FORMAT (&vinfo));
+    arg.bpp = gst_drm_bpp_from_drm (fmt);
+    w = GST_VIDEO_INFO_WIDTH (&vinfo);
+    arg.width = gst_drm_width_from_drm (fmt, w);
+    h = GST_VIDEO_INFO_FIELD_HEIGHT (&vinfo);
+    arg.height = gst_drm_height_from_drm (fmt, h);
+
+    ret = drmIoctl (self->fd, DRM_IOCTL_MODE_CREATE_DUMB, &arg);
+    if (ret)
+      goto no_pool;
+
+    gst_video_alignment_reset (&align);
+    align.padding_top = 0;
+    align.padding_left = 0;
+    align.padding_right = get_padding_right (self, &vinfo, arg.pitch);
+    if (!arg.pitch || align.padding_right == -1) {
+      align.padding_right = 0;
+      for (i = 0; i < GST_VIDEO_INFO_N_PLANES (&vinfo); i++)
+        align.stride_align[i] = 255;    /* 256-byte alignment */
+    }
+    align.padding_bottom = 0;
+    gst_video_info_align (&vinfo, &align);
+
+    GST_INFO_OBJECT (self, "padding_left %u, padding_right %u",
+        align.padding_left, align.padding_right);
+  }
+
+  drmModeFreeConnector (conn);
+
+  /* Update with the size use for display */
   size = GST_VIDEO_INFO_SIZE (&vinfo);
+
+  GST_INFO_OBJECT (self, "size %lu", size);
 
   pool = NULL;
   if (need_pool) {
@@ -1539,12 +2216,19 @@ gst_kms_sink_propose_allocation (GstBaseSink * bsink, GstQuery * query)
       GstStructure *config = gst_buffer_pool_get_config (pool);
       gst_buffer_pool_config_add_option (config,
           GST_BUFFER_POOL_OPTION_KMS_PRIME_EXPORT);
+      gst_buffer_pool_config_add_option (config,
+          GST_BUFFER_POOL_OPTION_VIDEO_ALIGNMENT);
+      gst_buffer_pool_config_set_video_alignment (config, &align);
       gst_buffer_pool_set_config (pool, config);
     }
   }
 
   /* we need at least 2 buffer because we hold on to the last one */
-  gst_query_add_allocation_pool (query, pool, size, 2, 0);
+  if (!self->hold_extra_sample)
+    gst_query_add_allocation_pool (query, pool, size, 2, 0);
+  else
+    gst_query_add_allocation_pool (query, pool, size, 3, 0);
+
   if (pool)
     gst_object_unref (pool);
 
@@ -1649,6 +2333,116 @@ event_failed:
 }
 
 static gboolean
+draw_rectangle (guint8 * chroma, roi_coordinate * roi, guint roi_cnt,
+    guint frame_w, guint frame_h, guint stride, guint roi_rect_thickness,
+    const GValue * roi_rect_yuv_color, GstVideoFormat format)
+{
+  guint i = 0, j = 0, k = 0, roi_ind = 0;
+  guint x = 0, y = 0, w = 0, h = 0;
+  guint8 *chroma_offset1, *chroma_offset2, *chroma_offset3;
+  guint8 *h_chroma_offset1, *h_chroma_offset2, *h_chroma_offset3;
+  guint8 *v_chroma_offset1, *v_chroma_offset2, *v_chroma_offset3;
+  guint8 thickness = 0;
+  gint u = 0, v = 0, vert_sampling = 0;
+
+  for (roi_ind = 0; roi_ind < roi_cnt; roi_ind++) {
+    /* Validate roi */
+    if ((roi[roi_ind].xmin + roi[roi_ind].width) > frame_w) {
+      roi[roi_ind].width = frame_w - roi[roi_ind].xmin;
+    }
+    if ((roi[roi_ind].ymin + roi[roi_ind].height) > frame_h) {
+      roi[roi_ind].height = frame_h - roi[roi_ind].ymin;
+    }
+    if (((roi[roi_ind].xmin + roi[roi_ind].width) > frame_w) ||
+        ((roi[roi_ind].ymin + roi[roi_ind].height) > frame_h)) {
+      GST_WARNING
+          ("skipping invalid roi xmin, ymin, width, height %d::%d::%d::%d",
+          roi[roi_ind].xmin, roi[roi_ind].ymin, roi[roi_ind].width,
+          roi[roi_ind].height);
+      continue;
+    }
+    if ((0 == roi[roi_ind].width) || (0 == roi[roi_ind].height)) {
+      GST_WARNING
+          ("skipping invalid roi xmin, ymin, width, height %d::%d::%d::%d",
+          roi[roi_ind].xmin, roi[roi_ind].ymin, roi[roi_ind].width,
+          roi[roi_ind].height);
+      continue;
+    }
+
+    /* Always start from first chroma component so make x even */
+    x = ((roi[roi_ind].xmin & 0x1) ==
+        0) ? (roi[roi_ind].xmin) : (roi[roi_ind].xmin - 1);
+    y = roi[roi_ind].ymin;
+    /* Always end with last chroma component so make width even */
+    w = ((roi[roi_ind].width & 0x1) ==
+        0) ? (roi[roi_ind].width) : (roi[roi_ind].width - 1);
+    h = roi[roi_ind].height;
+
+    if (format == GST_VIDEO_FORMAT_NV12)
+      vert_sampling = 2;
+    else if (format == GST_VIDEO_FORMAT_NV16)
+      vert_sampling = 1;
+
+    chroma_offset1 = chroma + ((y / vert_sampling) * stride) + x;
+    chroma_offset2 = chroma_offset1 + ((h / vert_sampling) - 1) * stride;
+    chroma_offset3 = chroma_offset1 + w - 2;
+
+    v_chroma_offset1 = h_chroma_offset1 = chroma_offset1;
+    v_chroma_offset2 = h_chroma_offset2 = chroma_offset2;
+    v_chroma_offset3 = h_chroma_offset3 = chroma_offset3;
+
+    if (gst_value_array_get_size (roi_rect_yuv_color) == 3) {
+      u = g_value_get_int (gst_value_array_get_value (roi_rect_yuv_color, 1));
+      v = g_value_get_int (gst_value_array_get_value (roi_rect_yuv_color, 2));
+    }
+
+    /* Draw horizontal lines */
+    for (thickness = 0; thickness < roi_rect_thickness; thickness++) {
+      for (k = 0; k < (2 / vert_sampling); k++) {
+        for (i = 0; i < w; i = i + 2) {
+          *(h_chroma_offset1 + i) = u;
+          *(h_chroma_offset1 + i + 1) = v;
+          *(h_chroma_offset2 + i) = u;
+          *(h_chroma_offset2 + i + 1) = v;
+        }
+        /* To draw same line horizontally for NV16 format as no vertical subsampling */
+        if (k < ((2 / vert_sampling) - 1)) {
+          /* Increase h_chroma_offset1 by stride vertically */
+          h_chroma_offset1 = h_chroma_offset1 + stride;
+          /* Decrease h_chroma_offset2 by stride vertically */
+          h_chroma_offset2 = h_chroma_offset2 - stride;
+        }
+      }
+      /* Increase h_chroma_offset1 by stride vertically and by 2 horizontally */
+      h_chroma_offset1 = h_chroma_offset1 + stride + 2;
+      /* Decrease h_chroma_offset2 by stride vertically and increase by 2 horizontally */
+      h_chroma_offset2 = h_chroma_offset2 - stride + 2;
+      /* Reduce width by 2 from both the side so effectively it will reduce 4 */
+      w = w - 4;
+    }
+
+    /* Draw vertical lines */
+    for (thickness = 0; thickness < roi_rect_thickness; thickness++) {
+      for (i = 0, j = 0; i < (h / vert_sampling); i++) {
+        *(v_chroma_offset1 + j) = u;
+        *(v_chroma_offset1 + j + 1) = v;
+        *(v_chroma_offset3 + j) = u;
+        *(v_chroma_offset3 + j + 1) = v;
+        j += stride;
+      }
+      /* Increase v_chroma_offset1 by stride vertically and by 2 horizontally */
+      v_chroma_offset1 = v_chroma_offset1 + stride + 2;
+      /* Increase v_chroma_offset3 by stride vertically and decrease by 2 horizontally */
+      v_chroma_offset3 = v_chroma_offset3 + stride - 2;
+      /* Reduce height by stride from both the side so effectively it will reduce by 2
+       * for NV16 format and by 4 for NV12 format */
+      h = h - (2 * vert_sampling);
+    }
+  }
+  return TRUE;
+}
+
+static gboolean
 gst_kms_sink_import_dmabuf (GstKMSSink * self, GstBuffer * inbuf,
     GstBuffer ** outbuf)
 {
@@ -1659,6 +2453,7 @@ gst_kms_sink_import_dmabuf (GstKMSSink * self, GstBuffer * inbuf,
   guint mems_idx[GST_VIDEO_MAX_PLANES];
   gsize mems_skip[GST_VIDEO_MAX_PLANES];
   GstMemory *mems[GST_VIDEO_MAX_PLANES];
+  GstMapInfo info;
 
   if (!self->has_prime_import)
     return FALSE;
@@ -1681,6 +2476,32 @@ gst_kms_sink_import_dmabuf (GstKMSSink * self, GstBuffer * inbuf,
 
   /* Update video info based on video meta */
   if (meta) {
+    /* Update YUV444 meta data from original GRAY8/GRAY10 frame */
+    if (self->gray_to_yuv444 && (meta->format == GST_VIDEO_FORMAT_GRAY8 ||
+            meta->format == GST_VIDEO_FORMAT_GRAY10_LE32)) {
+      /* skip the meta info modification in case the original meta height and
+       * vinfo height are the same, not sure why the second frame is this case */
+      if (meta->height == 3 * GST_VIDEO_INFO_HEIGHT (&self->vinfo)) {
+        if (meta->format == GST_VIDEO_FORMAT_GRAY8)
+          meta->format == GST_VIDEO_FORMAT_Y444;
+        else if (meta->format == GST_VIDEO_FORMAT_GRAY10_LE32)
+          meta->format == GST_VIDEO_FORMAT_Y444_10LE32;
+        meta->height = GST_VIDEO_INFO_HEIGHT (&self->vinfo);
+        meta->n_planes = 3;
+        meta->offset[0] = 0;
+        /* stride of vinfo for the first frame is not aligned, so recaculate the
+         * stride, instead of use stride from vinfo */
+        meta->stride[0] = meta->stride[0] + 255 & ~255;
+        meta->offset[1] = meta->offset[0] + meta->stride[0] * meta->height;
+        meta->stride[1] = meta->stride[0];
+        meta->offset[2] = meta->offset[1] + meta->stride[1] * meta->height;
+        meta->stride[2] = meta->stride[0];
+        GST_DEBUG_OBJECT (self,
+            "Meta data modified from GRAY to YUV444, width is %d, height is %d, planes is %d",
+            meta->width, meta->height, meta->n_planes);
+      }
+    }
+
     GST_VIDEO_INFO_WIDTH (&self->vinfo) = meta->width;
     GST_VIDEO_INFO_HEIGHT (&self->vinfo) = meta->height;
 
@@ -1708,14 +2529,36 @@ gst_kms_sink_import_dmabuf (GstKMSSink * self, GstBuffer * inbuf,
     /* And all memory found must be dmabuf */
     if (!gst_is_dmabuf_memory (mems[i]))
       return FALSE;
-  }
 
+    if ((i == CHROMA_PLANE) && meta && self->draw_roi) {
+      /* Draw ROI feature currently only supported for NV12 & NV16 formats */
+      if ((self->vinfo.finfo->format == GST_VIDEO_FORMAT_NV12) ||
+          (self->vinfo.finfo->format == GST_VIDEO_FORMAT_NV16)) {
+        GST_DEBUG_OBJECT (self, "xlnxkmssink :: Buffer chroma plane received");
+        gst_memory_map (mems[i], &info, GST_MAP_READWRITE);
+        if (info.data && self->roi_param.coordinate_param
+            && self->roi_param.count > 0) {
+          draw_rectangle ((info.data + meta->offset[i]),
+              self->roi_param.coordinate_param, self->roi_param.count,
+              meta->width, meta->height, meta->stride[i],
+              self->roi_rect_thickness, &self->roi_rect_yuv_color,
+              self->vinfo.finfo->format);
+          self->roi_param.count = 0;
+          g_free (self->roi_param.coordinate_param);
+          self->roi_param.coordinate_param = NULL;
+        }
+        gst_memory_unmap (mems[i], &info);
+      } else {
+        GST_DEBUG_OBJECT (self, "Draw ROI feature not supported for %s format",
+            gst_video_format_to_string (self->vinfo.finfo->format));
+      }
+    }
+  }
   ensure_kms_allocator (self);
 
   kmsmem = (GstKMSMemory *) gst_kms_allocator_get_cached (mems[0]);
   if (kmsmem) {
-    GST_LOG_OBJECT (self, "found KMS mem %p in DMABuf mem %p with fb id = %d",
-        kmsmem, mems[0], kmsmem->fb_id);
+    GST_LOG_OBJECT (self, "found KMS mem %p in DMABuf mem %p", kmsmem, mems[0]);
     goto wrap_mem;
   }
 
@@ -1765,7 +2608,7 @@ ensure_internal_pool (GstKMSSink * self, GstVideoInfo * in_vinfo,
   }
 
   caps = gst_video_info_to_caps (&vinfo);
-  pool = gst_kms_sink_create_pool (self, caps, gst_buffer_get_size (inbuf), 2);
+  pool = gst_kms_sink_create_pool (self, caps, GST_VIDEO_INFO_SIZE (&vinfo), 2);
   gst_caps_unref (caps);
 
   if (!pool)
@@ -1802,6 +2645,11 @@ gst_kms_sink_copy_to_dumb_buffer (GstKMSSink * self, GstVideoInfo * vinfo,
   ret = gst_buffer_pool_acquire_buffer (self->pool, &buf, NULL);
   if (ret != GST_FLOW_OK)
     goto create_buffer_failed;
+
+  if (self->gray_to_yuv444) {
+    GstVideoMeta *meta = gst_buffer_get_video_meta (inbuf);
+    meta->format = vinfo->finfo->format;
+  }
 
   if (!gst_video_frame_map (&inframe, vinfo, inbuf, GST_MAP_READ))
     goto error_map_src_buffer;
@@ -1876,24 +2724,316 @@ done:
   return buf;
 }
 
+static void
+gst_kms_sink_get_next_vsync_time (GstKMSSink * self, GstClock * clock,
+    GstClockTimeDiff * pred_vsync_time)
+{
+  GstClockTime time;
+  GstClockTimeDiff vblank_diff;
+
+  /* Predicted vsync time is when next vsync will come, calculate it from
+   * last_vblank time-stamp */
+  time = gst_clock_get_time (clock);
+  if (GST_CLOCK_TIME_IS_VALID (self->last_vblank)
+      && GST_BUFFER_DURATION_IS_VALID (self->last_buffer)) {
+    vblank_diff = GST_CLOCK_DIFF (self->last_vblank, time);
+    if (vblank_diff < GST_BUFFER_DURATION (self->last_buffer))
+      *pred_vsync_time =
+          GST_CLOCK_DIFF (vblank_diff, GST_BUFFER_DURATION (self->last_buffer));
+    else
+      *pred_vsync_time = 0;
+  } else {
+    *pred_vsync_time = 0;
+  }
+  GST_DEBUG_OBJECT (self, "got current time: %" GST_TIME_FORMAT
+      ", next vsync in %" G_GUINT64_FORMAT, GST_TIME_ARGS (time),
+      *pred_vsync_time);
+}
+
+static void
+xlnx_ll_synchronize (GstKMSSink * self, GstBuffer * buffer, GstClock * clock)
+{
+  GstReferenceTimestampMeta *meta;
+  static GstCaps *caps = NULL;
+  GstClockTime time;
+  GstClockTimeDiff diff;
+  GstClockTimeDiff vblank_diff;
+  GstClockTimeDiff pred_vblank_time;
+  GstClockTimeDiff wait_time;
+
+  if (G_UNLIKELY (!caps)) {
+    caps = gst_caps_new_empty_simple ("timestamp/x-xlnx-ll-decoder-out");
+    GST_MINI_OBJECT_FLAG_SET (caps, GST_MINI_OBJECT_FLAG_MAY_BE_LEAKED);
+  }
+
+  meta = gst_buffer_get_reference_timestamp_meta (buffer, caps);
+  if (!meta) {
+    GST_DEBUG_OBJECT (self, "no decoder out meta defined");
+    return;
+  }
+
+  time = gst_clock_get_time (clock);
+  diff = GST_CLOCK_DIFF (meta->timestamp, time);
+
+  gst_kms_sink_get_next_vsync_time (self, clock, &pred_vblank_time);
+  wait_time = diff + pred_vblank_time;
+
+  GST_LOG_OBJECT (self,
+      "meta: %" GST_TIME_FORMAT " clock: %" GST_TIME_FORMAT
+      " diff: %" GST_TIME_FORMAT " frame_time: %" GST_TIME_FORMAT
+      " pred_vblank_time: %" GST_TIME_FORMAT, GST_TIME_ARGS (meta->timestamp),
+      GST_TIME_ARGS (time), GST_TIME_ARGS (diff),
+      GST_TIME_ARGS (GST_BUFFER_DURATION (buffer)),
+      GST_TIME_ARGS (pred_vblank_time));
+
+  /* Make sure decoder has enough time (half frame duration) to write the buffer
+   * before passing to display */
+  if (GST_BUFFER_DURATION_IS_VALID (buffer)
+      && wait_time < GST_BUFFER_DURATION (buffer) / 2) {
+    /* We didn't wait enough */
+    GstClockID clock_id;
+    GstClockTimeDiff delta;
+
+    delta = GST_BUFFER_DURATION (buffer) / 2 - wait_time;
+    time += delta;
+
+    GST_LOG_OBJECT (self, "need to wait extra %" GST_TIME_FORMAT,
+        GST_TIME_ARGS (delta));
+
+    clock_id = gst_clock_new_single_shot_id (clock, time);
+    gst_clock_id_wait (clock_id, NULL);
+    gst_clock_id_unref (clock_id);
+  }
+}
+
+static void
+gst_kms_sink_fix_field_inversion (GstKMSSink * self, GstBuffer * buffer)
+{
+  guint32 flags_local = 0;
+  GstBuffer *buf = NULL;
+  GstMemory *mem;
+  guint32 fb_id, old_fb_id;
+
+  old_fb_id = self->buffer_id;
+  GST_DEBUG_OBJECT (self,
+      "Repeating last buffer and then sending current buffer to achieve resync");
+
+  if (GST_BUFFER_FLAG_IS_SET (buffer, GST_VIDEO_BUFFER_FLAG_ONEFIELD)) {
+    buf = self->previous_last_buffer;
+    if (GST_BUFFER_FLAG_IS_SET (buffer, GST_VIDEO_BUFFER_FLAG_TFF))
+      flags_local |= DRM_MODE_FB_ALTERNATE_BOTTOM;
+    else
+      flags_local |= DRM_MODE_FB_ALTERNATE_TOP;
+  }
+  mem = gst_buffer_peek_memory (buf, 0);
+  if (!gst_kms_memory_add_fb (mem, &self->vinfo, flags_local)) {
+    GST_ERROR_OBJECT (self, "Failed to get buffer object handle");
+    return;
+  }
+
+  fb_id = gst_kms_memory_get_fb_id (mem);
+
+  if (fb_id == 0) {
+    GST_ERROR_OBJECT (self, "Failed to get fb id for previous buffer");
+    return;
+  }
+
+  self->buffer_id = fb_id;
+
+  GST_OBJECT_LOCK (self);
+  if (!gst_kms_sink_sync (self)) {
+    GST_ERROR_OBJECT (self,
+        "Repeating buffer for correcting field inversion failed");
+  } else {
+    GST_DEBUG_OBJECT (self,
+        "Corrected field inversion by repeating buffer with self->buffer_id = %d, self->crtc_id = %d self->fd %x flags = %x",
+        self->buffer_id, self->crtc_id, self->fd, flags_local);
+  }
+  GST_OBJECT_UNLOCK (self);
+}
+
+static void
+gst_kms_sink_avoid_field_inversion (GstKMSSink * self, GstClock * clock)
+{
+  guint32 flags_local = 0, i = 0;
+  GstBuffer *buf = NULL;
+  GstClockTimeDiff pred_vsync_time;
+  GstMemory *mem;
+  guint32 fb_id;
+
+  gst_kms_sink_get_next_vsync_time (self, clock, &pred_vsync_time);
+  if (pred_vsync_time != 0 && pred_vsync_time < VSYNC_GAP_USEC * GST_USECOND) {
+    for (i = 0; i < 2; i++) {
+      if (GST_BUFFER_FLAG_IS_SET (self->previous_last_buffer,
+              GST_VIDEO_BUFFER_FLAG_ONEFIELD) && !i) {
+        buf = self->previous_last_buffer;
+        if (GST_BUFFER_FLAG_IS_SET (buf, GST_VIDEO_BUFFER_FLAG_TFF)) {
+          GST_DEBUG_OBJECT (self,
+              "Received TOP field, repeating previous last buffer");
+          flags_local |= DRM_MODE_FB_ALTERNATE_TOP;
+        } else {
+          GST_DEBUG_OBJECT (self,
+              "Received BOTTOM field, repeating previous last buffer");
+          flags_local |= DRM_MODE_FB_ALTERNATE_BOTTOM;
+        }
+      } else {
+        buf = self->last_buffer;
+        if (GST_BUFFER_FLAG_IS_SET (buf, GST_VIDEO_BUFFER_FLAG_TFF)) {
+          GST_DEBUG_OBJECT (self, "Received TOP field, repeating last buffer");
+          flags_local |= DRM_MODE_FB_ALTERNATE_TOP;
+        } else {
+          GST_DEBUG_OBJECT (self,
+              "Received BOTTOM field changing to bottom, repeating last buffer");
+          flags_local |= DRM_MODE_FB_ALTERNATE_BOTTOM;
+        }
+      }
+      mem = gst_buffer_peek_memory (buf, 0);
+      if (!gst_kms_memory_add_fb (mem, &self->vinfo, flags_local)) {
+        GST_DEBUG_OBJECT (self, "Failed to get buffer object for buffer  %d",
+            i + 1);
+        return;
+      }
+
+      fb_id = gst_kms_memory_get_fb_id (mem);
+      if (fb_id == 0) {
+        GST_DEBUG_OBJECT (self, "Failed to get fb id  for buffer %d", i + 1);
+        return;
+      }
+
+      self->buffer_id = fb_id;
+
+      GST_DEBUG_OBJECT (self, "displaying repeat fb %d", fb_id);
+      GST_DEBUG_OBJECT (self,
+          "Repeating buffer %d as vblank was about to miss since pred_vsync was %"
+          G_GUINT64_FORMAT, i + 1, pred_vsync_time);
+
+      GST_OBJECT_LOCK (self);
+      if (!gst_kms_sink_sync (self)) {
+        GST_DEBUG_OBJECT (self, "Repeating buffer failed");
+      } else {
+        GST_DEBUG_OBJECT (self,
+            "Repeated buffer with self->buffer_id = %d, self->crtc_id = %d self->fd %x flags = %x i = %d",
+            self->buffer_id, self->crtc_id, self->fd, flags_local, i);
+      }
+      GST_OBJECT_UNLOCK (self);
+    }
+  }
+}
+
+static gboolean
+handle_sei_info (GstKMSSink * self, GstEvent * event)
+{
+  const GstStructure *s;
+  guint32 payload_type;
+  GstBuffer *buf;
+  GstMapInfo map;
+  s = gst_event_get_structure (event);
+
+  if (!gst_structure_get (s, "payload-type", G_TYPE_UINT, &payload_type,
+          "payload", GST_TYPE_BUFFER, &buf, NULL)) {
+    GST_WARNING_OBJECT (self, "Failed to parse event");
+    return TRUE;
+  }
+  if (payload_type != 77) {
+    GST_WARNING_OBJECT (self,
+        "Payload type is not matching to draw boundign box.");
+    gst_buffer_unref (buf);
+    return TRUE;
+  }
+  if (!gst_buffer_map (buf, &map, GST_MAP_READ)) {
+    GST_WARNING_OBJECT (self, "Failed to map payload buffer");
+    gst_buffer_unref (buf);
+    return TRUE;
+  }
+
+  GST_DEBUG_OBJECT (self, "Requesting  (payload-type=%d)", payload_type);
+
+  gint uint_size = sizeof (unsigned int);
+  guint num = 2;
+  gint i = 0;
+  self->roi_param.ts = *(unsigned int *) (map.data);
+  self->roi_param.count = *(unsigned int *) (map.data + (num * uint_size));
+  num++;
+  self->roi_param.coordinate_param =
+      g_malloc0 (self->roi_param.count * sizeof (roi_coordinate));
+  GST_DEBUG_OBJECT (self, "xlnxkmssink :: roi count %u\n",
+      self->roi_param.count);
+  for (i = 0; i < self->roi_param.count; i++) {
+    self->roi_param.coordinate_param[i].xmin =
+        *(unsigned int *) (map.data + (num * uint_size));
+    num++;
+    self->roi_param.coordinate_param[i].ymin =
+        *(unsigned int *) (map.data + (num * uint_size));
+    num++;
+    self->roi_param.coordinate_param[i].width =
+        *(unsigned int *) (map.data + (num * uint_size));
+    num++;
+    self->roi_param.coordinate_param[i].height =
+        *(unsigned int *) (map.data + (num * uint_size));
+    num++;
+    GST_DEBUG_OBJECT (self,
+        "xlnxkmssink :: frame no, roi no, xmin, ymin, width, height %u::%u::%u::%u::%u\n",
+        (i + 1), self->roi_param.coordinate_param[i].xmin,
+        self->roi_param.coordinate_param[i].ymin,
+        self->roi_param.coordinate_param[i].width,
+        self->roi_param.coordinate_param[i].height);
+  }
+  gst_buffer_unmap (buf, &map);
+  gst_buffer_unref (buf);
+
+  return TRUE;
+}
+
+static gboolean
+gst_kms_sink_sink_event (GstBaseSink * bsink, GstEvent * event)
+{
+  GstKMSSink *self;
+  self = GST_KMS_SINK (bsink);
+  if (gst_event_has_name (event, OMX_ALG_GST_EVENT_INSERT_PREFIX_SEI)) {
+    GST_DEBUG_OBJECT (self, "xlnxkmssink :: SEI event received\n");
+    handle_sei_info (self, event);
+  }
+  return GST_BASE_SINK_CLASS (parent_class)->event (bsink, event);
+}
+
 static GstFlowReturn
 gst_kms_sink_show_frame (GstVideoSink * vsink, GstBuffer * buf)
 {
   gint ret;
   GstBuffer *buffer = NULL;
+  GstMemory *mem;
   guint32 fb_id;
   GstKMSSink *self;
-  GstVideoInfo *vinfo;
+  GstVideoInfo *vinfo = NULL;
   GstVideoCropMeta *crop;
   GstVideoRectangle src = { 0, };
   gint video_width, video_height;
   GstVideoRectangle dst = { 0, };
   GstVideoRectangle result;
   GstFlowReturn res;
+  GstClock *clock = NULL;
+  guint32 flags = 0;
+  gboolean err = FALSE;
+  GstClockTime start = GST_CLOCK_TIME_NONE, end = GST_CLOCK_TIME_NONE, timestamp = GST_CLOCK_TIME_NONE;
+  GstClockTimeDiff ts_diff = GST_CLOCK_TIME_NONE, ts_drift = GST_CLOCK_TIME_NONE;
 
   self = GST_KMS_SINK (vsink);
 
   res = GST_FLOW_ERROR;
+
+  if (GST_VIDEO_INFO_INTERLACE_MODE (&self->last_vinfo)) {
+    /* Skip first vsync to maintain adequate and
+     * constant gap between page_flip/set_plane and vsync*/
+    if (!self->last_buffer) {
+      GST_OBJECT_LOCK (self);
+      if (!gst_kms_sink_sync (self)) {
+        GST_DEBUG_OBJECT (self, "Failed to skip first vsync");
+      } else {
+        GST_DEBUG_OBJECT (self, "Skipped first vsync");
+      }
+      GST_OBJECT_UNLOCK (self);
+    }
+  }
 
   if (buf) {
     buffer = gst_kms_sink_get_input_buffer (self, buf);
@@ -1907,12 +3047,123 @@ gst_kms_sink_show_frame (GstVideoSink * vsink, GstBuffer * buf)
     video_height = src.h = self->last_height;
   }
 
-  /* Make sure buf is not used accidentally */
-  buf = NULL;
+  if (self->xlnx_ll) {
+    clock = gst_element_get_clock (GST_ELEMENT_CAST (self));
+    if (!clock) {
+      GST_DEBUG_OBJECT (self, "no clock set yet");
+      goto bail;
+    }
+    xlnx_ll_synchronize (self, buffer, clock);
+  }
 
   if (!buffer)
     return GST_FLOW_ERROR;
-  fb_id = gst_kms_memory_get_fb_id (gst_buffer_peek_memory (buffer, 0));
+
+  if (GST_VIDEO_INFO_INTERLACE_MODE (&self->last_vinfo)) {
+    clock = gst_element_get_clock (GST_ELEMENT_CAST (self));
+    if (!clock) {
+      GST_DEBUG_OBJECT (self, "no clock set yet");
+      goto bail;
+    }
+
+    if (self->last_buffer && self->prev_last_vblank
+        && self->avoid_field_inversion) {
+
+      start = gst_clock_get_time (clock);
+      gst_kms_sink_avoid_field_inversion (self, clock);
+      end = gst_clock_get_time (clock);
+
+      if (self->adjust_latency) {
+        gst_base_sink_set_processing_deadline (GST_BASE_SINK (self),
+            gst_base_sink_get_processing_deadline (GST_BASE_SINK (self)) +
+            GST_CLOCK_DIFF (start, end));
+        GST_DEBUG_OBJECT (self,
+            "Recovery time to avoid inversion : %" GST_TIME_FORMAT
+            " Set processing deadline to : %" GST_TIME_FORMAT,
+            GST_TIME_ARGS (GST_CLOCK_DIFF (start, end)),
+            GST_TIME_ARGS (gst_base_sink_get_processing_deadline (GST_BASE_SINK
+                    (self))));
+      }
+    }
+
+    if (self->fix_field_inversion && self->previous_last_buffer) {
+      if (self->is_last_err_corrected) {
+        self->is_last_err_corrected = FALSE;
+
+        timestamp = GST_BUFFER_PTS (buffer);
+        if (GST_CLOCK_TIME_IS_VALID (timestamp)
+            && GST_CLOCK_TIME_IS_VALID (self->last_err_corrected_ts)) {
+          ts_diff = GST_CLOCK_DIFF (self->last_err_corrected_ts, timestamp);
+          ts_drift =
+              ABS (GST_CLOCK_DIFF (GST_BUFFER_DURATION (buffer), ts_diff));
+          self->last_err_corrected_ts = GST_CLOCK_TIME_NONE;
+          if (ts_drift > 2 * GST_MSECOND
+              && ts_drift < (GST_BUFFER_DURATION (buffer) + 2 * GST_MSECOND)) {
+            GST_DEBUG_OBJECT (self,
+                "Dropping buffer as ts_drift: %" GST_TIME_FORMAT " timestamp  %"
+                GST_TIME_FORMAT, GST_TIME_ARGS (ts_drift),
+                GST_TIME_ARGS (timestamp));
+            goto done;
+          }
+        }
+      }
+      err = find_property_value_for_plane_id (self->fd,
+          self->primary_plane_id, "fid_err");
+
+      if (err == 1) {
+        GST_WARNING_OBJECT (self,
+            "Error bit is set we are in inversion mode as fid_err = %d", err);
+
+        if (!self->error_correction_margin) {
+          start = gst_clock_get_time (clock);
+          gst_kms_sink_fix_field_inversion (self, buffer);
+          end = gst_clock_get_time (clock);
+
+          GST_DEBUG_OBJECT (self,
+              "Setting last_err_corrected_ts to  timestamp  %" GST_TIME_FORMAT,
+              GST_TIME_ARGS (GST_BUFFER_PTS (buffer)));
+          self->is_last_err_corrected = TRUE;
+          self->last_err_corrected_ts = GST_BUFFER_PTS (buffer);
+          if (self->limit_error_recovery) {
+            self->error_correction_margin =
+                ((gint) GST_VIDEO_INFO_FPS_N (vinfo) /
+                GST_VIDEO_INFO_FPS_D (vinfo)) * 2;
+          }
+        }
+
+        if (self->error_correction_margin > 0)
+          self->error_correction_margin--;
+
+        if (self->adjust_latency) {
+          gst_base_sink_set_processing_deadline (GST_BASE_SINK (self),
+              gst_base_sink_get_processing_deadline (GST_BASE_SINK (self)) +
+              GST_CLOCK_DIFF (start, end));
+          GST_DEBUG_OBJECT (self,
+              "Recovery time to fix inversion : %" GST_TIME_FORMAT
+              " Set processing deadline to : %" GST_TIME_FORMAT,
+              GST_TIME_ARGS (GST_CLOCK_DIFF (start, end)),
+              GST_TIME_ARGS (gst_base_sink_get_processing_deadline
+                  (GST_BASE_SINK (self))));
+        }
+      }
+    }
+  }
+
+  if (GST_BUFFER_FLAG_IS_SET (buffer, GST_VIDEO_BUFFER_FLAG_ONEFIELD)) {
+    if (GST_BUFFER_FLAG_IS_SET (buffer, GST_VIDEO_BUFFER_FLAG_TFF)) {
+      GST_DEBUG_OBJECT (vsink, "Received TOP field.");
+      flags |= DRM_MODE_FB_ALTERNATE_TOP;
+    } else {
+      GST_DEBUG_OBJECT (vsink, "Received BOTTOM field.");
+      flags |= DRM_MODE_FB_ALTERNATE_BOTTOM;
+    }
+  }
+
+  mem = gst_buffer_peek_memory (buffer, 0);
+  if (!gst_kms_memory_add_fb (mem, &self->vinfo, flags))
+    goto buffer_invalid;
+
+  fb_id = gst_kms_memory_get_fb_id (mem);
   if (fb_id == 0)
     goto buffer_invalid;
 
@@ -2000,16 +3251,35 @@ sync_frame:
     goto bail;
   }
 
+  if (clock) {
+    if (GST_CLOCK_TIME_IS_VALID (self->last_vblank))
+      self->prev_last_vblank = self->last_vblank;
+    self->last_vblank = gst_clock_get_time (clock);
+    gst_object_unref (clock);
+  }
+
   /* Save the rendered buffer and its metadata in case a redraw is needed */
   if (buffer != self->last_buffer) {
+    if (self->hold_extra_sample)
+      gst_buffer_replace (&self->previous_last_buffer, self->last_buffer);
     gst_buffer_replace (&self->last_buffer, buffer);
     self->last_width = GST_VIDEO_SINK_WIDTH (self);
     self->last_height = GST_VIDEO_SINK_HEIGHT (self);
     self->last_vinfo = self->vinfo;
+  } else {
+    if (self->hold_extra_sample) {
+      gst_buffer_unref (self->previous_last_buffer);
+      self->hold_extra_sample = FALSE;
+    }
+    gst_buffer_unref (self->last_buffer);
   }
-  g_clear_pointer (&self->tmp_kmsmem, gst_memory_unref);
+
+  /* For fullscreen_enabled, tmp_kmsmem is used just to set CRTC mode */
+  if (self->modesetting_enabled)
+    g_clear_pointer (&self->tmp_kmsmem, gst_memory_unref);
 
   GST_OBJECT_UNLOCK (self);
+done:
   res = GST_FLOW_OK;
 
 bail:
@@ -2067,7 +3337,10 @@ gst_kms_sink_drain (GstKMSSink * self)
     dumb_buf = gst_kms_sink_copy_to_dumb_buffer (self, &self->last_vinfo,
         parent_meta->buffer);
     last_buf = self->last_buffer;
-    self->last_buffer = dumb_buf;
+    /* Take an additional ref as 'self->last_buffer' will be unreferenced
+     *  twice during the 'stop'. It will be unreferenced explicitely
+     *  and then during the pool destruction. */
+    self->last_buffer = gst_buffer_ref (dumb_buf);
 
     gst_kms_allocator_clear_cache (self->allocator);
     gst_kms_sink_show_frame (GST_VIDEO_SINK (self), NULL);
@@ -2173,6 +3446,21 @@ gst_kms_sink_set_property (GObject * object, guint prop_id,
     case PROP_CAN_SCALE:
       sink->can_scale = g_value_get_boolean (value);
       break;
+    case PROP_HOLD_EXTRA_SAMPLE:
+      sink->hold_extra_sample = g_value_get_boolean (value);
+      break;
+    case PROP_DO_TIMESTAMP:
+      sink->do_timestamp = g_value_get_boolean (value);
+      break;
+    case PROP_AVOID_FIELD_INVERSION:
+      sink->avoid_field_inversion = g_value_get_boolean (value);
+      break;
+    case PROP_ADJUST_LATENCY:
+      sink->adjust_latency = g_value_get_boolean (value);
+      break;
+    case PROP_LIMIT_ERROR_RECOVERY:
+      sink->limit_error_recovery = g_value_get_boolean (value);
+      break;
     case PROP_CONNECTOR_PROPS:{
       const GstStructure *s = gst_value_get_structure (value);
 
@@ -2198,6 +3486,28 @@ gst_kms_sink_set_property (GObject * object, guint prop_id,
       break;
     case PROP_SKIP_VSYNC:
       sink->skip_vsync = g_value_get_boolean (value);
+      break;
+    case PROP_FULLSCREEN_OVERLAY:
+      sink->fullscreen_enabled = g_value_get_boolean (value);
+      break;
+    case PROP_FORCE_NTSC_TV:
+      sink->force_ntsc_tv = g_value_get_boolean (value);
+      break;
+    case PROP_GRAY_TO_YUV444:
+      sink->gray_to_yuv444 = g_value_get_boolean (value);
+      break;
+    case PROP_DRAW_ROI:
+      sink->draw_roi = g_value_get_boolean (value);
+      break;
+    case PROP_ROI_RECT_THICKNESS:
+      sink->roi_rect_thickness = g_value_get_uint (value);
+      break;
+    case PROP_ROI_RECT_COLOR:
+      if (gst_value_array_get_size (value) == 3)
+        g_value_copy (value, &sink->roi_rect_yuv_color);
+      else
+        GST_DEBUG_OBJECT (sink,
+            "Badly formatted color value, must contain three gint");
       break;
     default:
       if (!gst_video_overlay_set_property (object, PROP_N, prop_id, value))
@@ -2246,11 +3556,43 @@ gst_kms_sink_get_property (GObject * object, guint prop_id,
       g_value_set_int (value, sink->vdisplay);
       GST_OBJECT_UNLOCK (sink);
       break;
+    case PROP_HOLD_EXTRA_SAMPLE:
+      g_value_set_boolean (value, sink->hold_extra_sample);
+      break;
+    case PROP_DO_TIMESTAMP:
+      g_value_set_boolean (value, sink->do_timestamp);
+      break;
+    case PROP_AVOID_FIELD_INVERSION:
+      g_value_set_boolean (value, sink->avoid_field_inversion);
+      break;
+    case PROP_LIMIT_ERROR_RECOVERY:
+      g_value_set_boolean (value, sink->limit_error_recovery);
+      break;
     case PROP_CONNECTOR_PROPS:
       gst_value_set_structure (value, sink->connector_props);
       break;
+    case PROP_ADJUST_LATENCY:
+      g_value_set_boolean (value, sink->adjust_latency);
+      break;
     case PROP_PLANE_PROPS:
       gst_value_set_structure (value, sink->plane_props);
+    case PROP_FULLSCREEN_OVERLAY:
+      g_value_set_boolean (value, sink->fullscreen_enabled);
+      break;
+    case PROP_FORCE_NTSC_TV:
+      g_value_set_boolean (value, sink->force_ntsc_tv);
+      break;
+    case PROP_GRAY_TO_YUV444:
+      g_value_set_boolean (value, sink->gray_to_yuv444);
+      break;
+    case PROP_DRAW_ROI:
+      g_value_set_boolean (value, sink->draw_roi);
+      break;
+    case PROP_ROI_RECT_THICKNESS:
+      g_value_set_uint (value, sink->roi_rect_thickness);
+      break;
+    case PROP_ROI_RECT_COLOR:
+      g_value_copy (&sink->roi_rect_yuv_color, value);
       break;
     case PROP_FD:
       g_value_set_int (value, sink->fd);
@@ -2276,6 +3618,7 @@ gst_kms_sink_finalize (GObject * object)
   g_clear_pointer (&sink->connector_props, gst_structure_free);
   g_clear_pointer (&sink->plane_props, gst_structure_free);
   g_clear_pointer (&sink->tmp_kmsmem, gst_memory_unref);
+  g_value_unset (&sink->roi_rect_yuv_color);
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
@@ -2288,10 +3631,16 @@ gst_kms_sink_init (GstKMSSink * sink)
   sink->conn_id = -1;
   sink->plane_id = -1;
   sink->can_scale = TRUE;
+  sink->skip_vsync = FALSE;
+  sink->last_vblank = GST_CLOCK_TIME_NONE;
+  sink->prev_last_vblank = GST_CLOCK_TIME_NONE;
+  sink->last_ts = GST_CLOCK_TIME_NONE;
+  sink->last_orig_ts = GST_CLOCK_TIME_NONE;
+  sink->last_err_corrected_ts = GST_CLOCK_TIME_NONE;
   gst_poll_fd_init (&sink->pollfd);
   sink->poll = gst_poll_new (TRUE);
   gst_video_info_init (&sink->vinfo);
-  sink->skip_vsync = FALSE;
+  g_value_init (&sink->roi_rect_yuv_color, GST_TYPE_ARRAY);
 
 #ifdef HAVE_DRM_HDR
   sink->no_infoframe = FALSE;
@@ -2329,6 +3678,7 @@ gst_kms_sink_class_init (GstKMSSinkClass * klass)
 
   basesink_class->start = GST_DEBUG_FUNCPTR (gst_kms_sink_start);
   basesink_class->stop = GST_DEBUG_FUNCPTR (gst_kms_sink_stop);
+  basesink_class->get_times = GST_DEBUG_FUNCPTR (gst_kms_sink_get_times);
   basesink_class->set_caps = GST_DEBUG_FUNCPTR (gst_kms_sink_set_caps);
   basesink_class->get_caps = GST_DEBUG_FUNCPTR (gst_kms_sink_get_caps);
   basesink_class->propose_allocation = gst_kms_sink_propose_allocation;
@@ -2336,6 +3686,7 @@ gst_kms_sink_class_init (GstKMSSinkClass * klass)
 
   videosink_class->show_frame = gst_kms_sink_show_frame;
 
+  basesink_class->event = GST_DEBUG_FUNCPTR (gst_kms_sink_sink_event);
   gobject_class->finalize = gst_kms_sink_finalize;
   gobject_class->set_property = gst_kms_sink_set_property;
   gobject_class->get_property = gst_kms_sink_get_property;
@@ -2444,6 +3795,84 @@ gst_kms_sink_class_init (GstKMSSinkClass * klass)
       G_PARAM_READABLE | G_PARAM_STATIC_STRINGS);
 
   /**
+   * kmssink: hold-extra-sample:
+   *
+   * Xilinx Video IP's like mixer, framebuffer read work in
+   * asynchronous mode of operation where register settings
+   * for next frame can be programmed at any time rather
+   * than waiting first for an interrupt. Due to this newly
+   * programmed settings don't become active until currently
+   * processed frame completes leading to one frame delay
+   * between programming and actual writing of data to memory.
+   *
+   * Set this property for above scenario so that kmssink doesn't
+   * release the buffer which is yet to be consumed by Video ip.
+   */
+  g_properties[PROP_HOLD_EXTRA_SAMPLE] =
+      g_param_spec_boolean ("hold-extra-sample",
+      "Hold extra sample",
+      "When enabled, the sink will keep references to last two buffers", FALSE,
+      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
+
+  /**
+   * kmssink: do-timestamp:
+   *
+   * If there is no clock recovery hardware present, there is
+   * a high possibility of clock drift between the display clock
+   * and the one used by upstream. To avoid it or minimize it's impact
+   * we change the buffer PTS as per vsync interval when this is enabled.
+   *
+   * FIXME: This is only supported and tested with non-live usecases.
+   *
+   */
+  g_properties[PROP_DO_TIMESTAMP] =
+      g_param_spec_boolean ("do-timestamp",
+      "Do timestamp",
+      "Do Timestamping as per vsync interval", FALSE,
+      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
+
+  /**
+   * kmssink: avoid-field-inversion:
+   *
+   * If display clock running faster than rate at which input is coming,
+   * at some point it's highly likely that we fail to submit buffer
+   * before vsync, and in case of alternate interlace mode it may cause
+   * field inversion problem as display will repeat previous field with
+   * invert polarity. To avoid this, kmssink predicts the next vblank and
+   * if we are too close to vblank, we repeat previous pair before submitting
+   * next field.
+   */
+  g_properties[PROP_AVOID_FIELD_INVERSION] =
+      g_param_spec_boolean ("avoid-field-inversion",
+      "Avoid field inversion",
+      "Predict and avoid field inversion by repeating previous pair", FALSE,
+      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
+
+  /**
+   * kmssink: adjust-latency:
+   *
+   * Adjust latency by increasing the processing deadline to compensate
+   * time taken for any preprocessing or correction done in kmssink
+   * before displaying the buffer.
+   */
+  g_properties[PROP_ADJUST_LATENCY] =
+      g_param_spec_boolean ("adjust-latency",
+      "Adjust latency",
+      "Adjust latency to compensate any preprocessing done", FALSE,
+      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
+
+  /**
+   * kmssink: limit-error-recovery:
+   *
+   * Do error correction for field inversion only once per second.
+   */
+  g_properties[PROP_LIMIT_ERROR_RECOVERY] =
+      g_param_spec_boolean ("limit-error-recovery",
+      "Limit error recovery",
+      "Do error correction only once per second",
+      FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
+
+  /**
    * kmssink:connector-properties:
    *
    * Additional properties for the connector. Keys are strings and values
@@ -2494,6 +3923,76 @@ gst_kms_sink_class_init (GstKMSSinkClass * klass)
       g_param_spec_boolean ("skip-vsync", "Skip Internal VSync",
       "When enabled will not wait internally for vsync. "
       "Should be used for atomic drivers to avoid double vsync.", FALSE,
+      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
+
+   /** kmssink:fullscreen-overlay:
+   *
+   * If the output connector is already active, the sink automatically uses an
+   * overlay plane. Enforce mode setting in the kms sink and output to the
+   * base plane to override the automatic behavior.
+   */
+  g_properties[PROP_FULLSCREEN_OVERLAY] =
+      g_param_spec_boolean ("fullscreen-overlay",
+      "Fullscreen mode",
+      "When enabled, the sink sets CRTC size same as input video size", FALSE,
+      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
+
+  /**
+   * kmssink: force-ntsc-tv:
+   *
+   * Convert NTSC DV (720x480i) content to NTSC TV D1 (720x486i) display.
+   */
+  g_properties[PROP_FORCE_NTSC_TV] =
+      g_param_spec_boolean ("force-ntsc-tv",
+      "Convert NTSC DV content to NTSC TV D1 display",
+      "When enabled, NTSC DV (720x480i) content is displayed at NTSC TV D1 (720x486i) resolution",
+      FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
+
+  /**
+   * kmssink: gray-to-y444:
+   *
+   * Convert GRAY (grayscale 1920x3240) video to YUV444 (planar 4:4:4 1920x1080) display.
+   */
+  g_properties[PROP_GRAY_TO_YUV444] =
+      g_param_spec_boolean ("gray-to-y444", "gray to yuv444",
+      "Convert GRAY (grayscale 1920x3240) video to YUV444 (planar 4:4:4 1920x1080) display",
+      FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
+
+  /**
+   * kmssink: draw-roi:
+   *
+   * If draw-roi option is enabled then it will draw roi bounding-boxes on frame.
+   */
+  g_properties[PROP_DRAW_ROI] =
+      g_param_spec_boolean ("draw-roi", "draw roi",
+      "Enable draw-roi to draw bounding-boxes on frame",
+      FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
+
+  /**
+   * kmssink: roi-rectangle-thickness:
+   *
+   * If roi rectangle thickness is provided then it will draw roi bounding-boxes
+   * with given thickness.
+   */
+  g_properties[PROP_ROI_RECT_THICKNESS] =
+      g_param_spec_uint ("roi-rectangle-thickness", "roi rectangle thickness",
+      "ROI rectangle thickness size to draw bounding-boxes on frame",
+      ROI_RECT_THICKNESS_MIN, ROI_RECT_THICKNESS_MAX, ROI_RECT_THICKNESS_MIN,
+      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
+
+  /**
+   * kmssink: roi-rectangle-color:
+   *
+   * If roi rectangle color is provided then it will draw roi bounding-boxes
+   * with given color.
+   */
+  g_properties[PROP_ROI_RECT_COLOR] =
+      gst_param_spec_array ("roi-rectangle-color", "roi rectangle color",
+      "ROI rectangle color ('<Y, U, V>') to draw bounding-boxes on frame",
+      g_param_spec_int ("color-val", "Color Value",
+          "One of Y, U or V value.", ROI_RECT_COLOR_MIN,
+          ROI_RECT_COLOR_MAX, ROI_RECT_COLOR_MIN,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT),
       G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
 
   g_object_class_install_properties (gobject_class, PROP_N, g_properties);

@@ -35,11 +35,19 @@
 G_BEGIN_DECLS
 
 /* Keep synced with gst_omx_video_get_format_from_omx(). Sort by decreasing quality */
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
+#define GST_OMX_VIDEO_DEC_SUPPORTED_FORMATS "{ NV16_10LE32, NV12_10LE32, " \
+"NV16, NV12, GRAY10_LE32, GRAY8, Y444, Y444_10LE32 }"
+
+#define GST_OMX_VIDEO_ENC_SUPPORTED_FORMATS "{ NV16_10LE32, NV12_10LE32, " \
+"NV16, NV12, GRAY10_LE32, GRAY8, Y444, Y444_10LE32 }"
+#else
 #define GST_OMX_VIDEO_DEC_SUPPORTED_FORMATS "{ NV16_10LE32, NV12_10LE32, " \
   "NV16, YUY2, YVYU, UYVY, NV12, I420, RGB16, BGR16, ABGR, ARGB, GRAY8 }"
 
 #define GST_OMX_VIDEO_ENC_SUPPORTED_FORMATS "{ NV16_10LE32, NV12_10LE32, " \
   "NV16, NV12, I420, GRAY8 }"
+#endif
 
 typedef struct
 {
@@ -68,6 +76,12 @@ gboolean gst_omx_video_is_equal_framerate_q16 (OMX_U32 q16_a, OMX_U32 q16_b);
 
 gboolean gst_omx_video_get_port_padding (GstOMXPort * port, GstVideoInfo * info_orig,
     GstVideoAlignment * align);
+
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
+GstCaps * gst_omx_video_add_xlnx_ll_to_caps (GstCaps * caps, gboolean encoder);
+#endif
+gboolean gst_omx_video_port_support_resolution (GstOMXPort * port, guint width, guint height);
+
 
 G_END_DECLS
 

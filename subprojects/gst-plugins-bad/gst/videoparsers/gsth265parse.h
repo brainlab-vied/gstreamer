@@ -110,6 +110,7 @@ struct _GstH265Parse
   gboolean predicted;
   gboolean bidirectional;
   gboolean header;
+  gboolean frame_start;
   gboolean framerate_from_caps;
   /* AU state */
   gboolean picture_start;
@@ -122,11 +123,18 @@ struct _GstH265Parse
   GstClockTime pending_key_unit_ts;
   GstEvent *force_key_unit_event;
 
+  /* For insertion of AU Delimiter */
+  gboolean aud_needed;
+  gboolean aud_insert;
+
   GstVideoMasteringDisplayInfo mastering_display_info;
   guint mastering_display_info_state;
 
   GstVideoContentLightLevel content_light_level;
   guint content_light_level_state;
+
+  guint8 preferred_transfer_char;
+  guint alt_transfer_char_state;
 
   /* For forward predicted trickmode */
   gboolean discard_bidirectional;

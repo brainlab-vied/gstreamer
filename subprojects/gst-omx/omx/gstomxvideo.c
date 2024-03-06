@@ -82,7 +82,7 @@ gst_omx_video_get_format_from_omx (OMX_COLOR_FORMATTYPE omx_colorformat)
     case OMX_COLOR_Format24bitBGR888:
       format = GST_VIDEO_FORMAT_BGR;
       break;
-#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
       /* Formats defined in extensions have their own enum so disable to -Wswitch warning */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wswitch"
@@ -91,6 +91,9 @@ gst_omx_video_get_format_from_omx (OMX_COLOR_FORMATTYPE omx_colorformat)
       break;
     case OMX_ALG_COLOR_FormatYUV422SemiPlanar10bitPacked:
       format = GST_VIDEO_FORMAT_NV16_10LE32;
+      break;
+    case OMX_ALG_COLOR_FormatL10bitPacked:
+      format = GST_VIDEO_FORMAT_GRAY10_LE32;
       break;
 #pragma GCC diagnostic pop
 #endif
@@ -354,3 +357,74 @@ gst_omx_video_get_port_padding (GstOMXPort * port, GstVideoInfo * info_orig,
 
   return TRUE;
 }
+
+#if defined(USE_OMX_TARGET_ZYNQ_USCALE_PLUS) || defined(USE_OMX_TARGET_VERSAL)
+
+gboolean
+gst_omx_video_port_support_resolution (GstOMXPort * port, guint width,
+    guint height)
+{
+  OMX_ALG_VIDEO_CONFIG_NOTIFY_RESOLUTION_CHANGE config;
+  OMX_ERRORTYPE err;
+
+  GST_OMX_INIT_STRUCT (&config);
+  config.nPortIndex = port->index;
+
+  err =
+      gst_omx_component_get_config (port->comp,
+      OMX_ALG_IndexConfigVideoMaxResolutionChange, &config);
+
+  if (err != OMX_ErrorNone) {
+    GST_ERROR_OBJECT (port->comp->parent,
+        "Failed to get max resolution change on port %d: %s (0x%08x)",
+        port->index, gst_omx_error_to_string (err), err);
+    return FALSE;
+  }
+
+  if (config.nWidth < width || config.nHeight < height) {
+    GST_DEBUG_OBJECT (port->comp->parent,
+        "Port %d supports max %dx%d so it cannot handle %dx%d",
+        port->index, config.nWidth, config.nHeight, width, height);
+    return FALSE;
+  }
+
+  GST_LOG_OBJECT (port->comp->parent,
+      "Port %d supports max %dx%d so it can handle %dx%d",
+      port->index, config.nWidth, config.nHeight, width, height);
+
+  return TRUE;
+}
+
+#define SYNC_IP_DEV_ENCODER "/dev/xlnxsync0"
+#define SYNC_IP_DEV_DECODER "/dev/xlnxsync1"
+
+static gboolean
+xlnx_ll_supported (gboolean encoder)
+{
+  if (encoder)
+    return g_file_test (SYNC_IP_DEV_ENCODER, G_FILE_TEST_EXISTS);
+  else
+    return TRUE;                /* Not using decoder syncip currently */
+}
+
+GstCaps *
+gst_omx_video_add_xlnx_ll_to_caps (GstCaps * caps, gboolean encoder)
+{
+  GstCaps *xlnx_ll;
+  guint i;
+
+  if (!xlnx_ll_supported (encoder))
+    return caps;
+
+  xlnx_ll = gst_caps_copy (caps);
+  for (i = 0; i < gst_caps_get_size (xlnx_ll); i++) {
+    GstCapsFeatures *features;
+
+    features = gst_caps_get_features (xlnx_ll, i);
+    gst_caps_features_remove (features, GST_CAPS_FEATURE_MEMORY_SYSTEM_MEMORY);
+    gst_caps_features_add (features, GST_CAPS_FEATURE_MEMORY_XLNX_LL);
+  }
+
+  return gst_caps_merge (caps, xlnx_ll);
+}
+#endif
