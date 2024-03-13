@@ -53,7 +53,6 @@
 
 #include <gst/video/gstvideometa.h>
 #include <gst/video/gstvideopool.h>
-#include "edid-utils.h"
 
 #include "gstv4l2elements.h"
 #include "gstv4l2src.h"

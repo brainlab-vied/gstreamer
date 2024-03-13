@@ -1,5 +1,4 @@
 v4l2_sources = [
-  'edid-utils.c',
   'gstv4l2.c',
   'gstv4l2element.c',
   'gstv4l2allocator.c',
