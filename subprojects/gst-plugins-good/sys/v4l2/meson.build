@@ -34,6 +34,7 @@ v4l2_sources = [
   'tuner.c',
   'tunerchannel.c',
   'tunernorm.c',
+  'ext/xlnx-ll/xvfbsync.c',
 ]
 
 v4l2 = get_option('v4l2')
