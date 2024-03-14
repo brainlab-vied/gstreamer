@@ -25,6 +25,7 @@
 #define __GST_V4L2_OBJECT_H__
 
 #include "ext/videodev2.h"
+#include "ext/xlnx-ll/xvfbsync.h"
 #ifdef HAVE_LIBV4L2
 #  include <libv4l2.h>
 #endif
