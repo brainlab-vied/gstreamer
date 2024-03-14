@@ -57,6 +57,8 @@
 #include "gstv4l2vp8enc.h"
 #include "gstv4l2vp9enc.h"
 #include "gstv4l2transform.h"
+#include "gstxilinxscd.h"
+#include "gstxlnxabrscaler.h"
 
 GST_DEBUG_CATEGORY_EXTERN (v4l2_debug);
 #define GST_CAT_DEFAULT v4l2_debug
