@@ -6,8 +6,6 @@ elif omx_target == 'zynqultrascaleplus'
   sub = 'zynqultrascaleplus'
 elif omx_target == 'tizonia'
   sub = 'tizonia'
-elif omx_target == 'versal'
-  sub = 'versal'
 else
   # No config file defined for the 'generic' target
   sub = ''
